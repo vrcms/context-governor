@@ -1,8 +1,8 @@
 """Cross-surface integration: the proxy (Surface A) and the MCP server (Surface B)
 share ONE on-disk store, so a handle minted by either resolves in both.
 
-This pins the "one store, two surfaces" contract asserted in wiki/context-governor.md
-and the surface notes. Two *separate* DurableStore instances at the SAME root model the
+This pins the "one store, two surfaces" contract. Two *separate* DurableStore
+instances at the SAME root model the
 two real processes sharing the filesystem. No network: FakeCounter throughout.
 """
 
