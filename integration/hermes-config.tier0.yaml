@@ -4,7 +4,7 @@
 # `model.context_length` HOT-RELOAD on a running gateway. This bounds the
 # fruitless re-compaction loop on its own; the Context Governor proxy removes
 # the residual (a single giant tool dump that still overflows the protected
-# tail). See tasks/plan.md §"Tier 0" and wiki/hermes-compaction.md for the why.
+# tail). See wiki/hermes-compaction.md for the why.
 
 model:
   # MUST match `llama-server -c`. If the summarizer (auxiliary.compression) model

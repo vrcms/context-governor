@@ -41,5 +41,4 @@ server is the cooperative complement.
 ## Status
 
 Both surfaces implemented and tested; validated live in front of Hermes Agent (~60% wire
-reduction on a long tool-heavy session). See [tasks/plan.md](../tasks/plan.md) for the full
-milestone history and design rationale.
+reduction on a long tool-heavy session).

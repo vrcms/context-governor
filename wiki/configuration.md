@@ -370,4 +370,4 @@ run-governor --config governor.toml --provider llama --context-budget-ratio 0.55
 ## See also
 - [[context-governor]] — architecture overview · [[surface-a-proxy]] — where the params act
 - [[no-re-fire-invariant]] — why the high/low-water gap matters · [[durable-store]] — the store
-- [`integration/README.md`](../integration/README.md) — copy-paste wiring · [`tasks/plan.md`](../tasks/plan.md) — milestone history
+- [`integration/README.md`](../integration/README.md) — copy-paste wiring
