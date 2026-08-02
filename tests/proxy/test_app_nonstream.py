@@ -263,3 +263,123 @@ async def test_healthz_ok_and_upstream_not_called(make_app):
     assert upstream.call_count == 0
     assert upstream.stream_count == 0
     assert upstream.get_paths == []
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/models/{model_id} — synthesized retrieve-model reply
+# ---------------------------------------------------------------------------
+
+_MODELS_LIST = {
+    "object": "list",
+    "data": [{"id": "real.gguf", "object": "model", "owned_by": "llamacpp"}],
+}
+
+
+@pytest.mark.asyncio
+async def test_retrieve_model_synthesized_from_the_list(make_app):
+    """hermes-agent probes /v1/models/<alias> (OpenAI retrieve-model); llama-server
+    has no such route, so the proxy synthesizes it from the SAME list /v1/models
+    serves — aliased id, real context_length injected."""
+    app, upstream, store, rewriter = make_app(
+        response=FAKE_RESPONSE, get_responses={"/v1/models": _MODELS_LIST}
+    )
+    app.state.n_ctx = 75776
+    r = await _get(app, "/v1/models/context-governor")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == "context-governor"          # alias presented, not the gguf
+    assert body["object"] == "model"
+    assert body["owned_by"] == "llamacpp"            # other fields inherited
+    assert body["context_length"] == 75776           # true window injected
+    assert upstream.get_paths == ["/v1/models"]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_model_unknown_id_is_an_openai_404(make_app):
+    app, upstream, store, rewriter = make_app(
+        response=FAKE_RESPONSE, get_responses={"/v1/models": _MODELS_LIST}
+    )
+    r = await _get(app, "/v1/models/no-such-model")
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"]["code"] == "model_not_found"
+    assert "no-such-model" in body["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Trailing assistant-run merge (llama-server 400s >=2 trailing assistants)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trailing_assistant_run_merged_before_forwarding(make_app):
+    """The 2026-07-20 live 400: a harness wire ending [.., assistant, assistant]
+    is rejected by llama-server's template preflight. The proxy merges the
+    trailing run into ONE assistant message; the prefix is untouched."""
+    app, upstream, store, rewriter = make_app(response=FAKE_RESPONSE)
+    msgs = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "partial answer"},
+        {"role": "assistant", "content": "continue prefill"},
+    ]
+    r = await _post(app, "/v1/chat/completions", json={"messages": msgs})
+    assert r.status_code == 200
+    sent = upstream.last_payload["messages"]
+    assert len(sent) == 2                               # run collapsed
+    assert sent[0] == msgs[0]                           # prefix byte-identical
+    assert sent[1]["role"] == "assistant"
+    assert sent[1]["content"] == "partial answer\ncontinue prefill"
+    r = await _get(app, "/metrics")
+    assert r.json()["assistant_tail_merges"] == 1
+
+
+@pytest.mark.asyncio
+async def test_trailing_run_with_tool_calls_left_untouched(make_app):
+    """tool_calls payloads cannot be merged coherently — the wire passes as-is
+    (upstream's verdict stands) rather than being corrupted."""
+    app, upstream, store, rewriter = make_app(response=FAKE_RESPONSE)
+    msgs = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "1", "function": {"name": "read"}}]},
+        {"role": "assistant", "content": "retry prefill"},
+    ]
+    r = await _post(app, "/v1/chat/completions", json={"messages": msgs})
+    assert r.status_code == 200
+    assert upstream.last_payload["messages"] == msgs
+    r = await _get(app, "/metrics")
+    assert r.json()["assistant_tail_merges"] == 0
+
+
+@pytest.mark.asyncio
+async def test_single_trailing_assistant_is_not_a_run(make_app):
+    app, upstream, store, rewriter = make_app(response=FAKE_RESPONSE)
+    msgs = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "one assistant prefill is legal"},
+    ]
+    r = await _post(app, "/v1/chat/completions", json={"messages": msgs})
+    assert r.status_code == 200
+    assert upstream.last_payload["messages"] == msgs
+
+
+@pytest.mark.asyncio
+async def test_trailing_run_content_parts_concatenated(make_app):
+    """Mixed str + content-parts tails merge into one parts list (multimodal
+    wires stay structured; nothing is dropped)."""
+    app, upstream, store, rewriter = make_app(response=FAKE_RESPONSE)
+    parts = [{"type": "text", "text": "see this"},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
+    msgs = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "partial answer"},
+        {"role": "assistant", "content": parts},
+    ]
+    r = await _post(app, "/v1/chat/completions", json={"messages": msgs})
+    assert r.status_code == 200
+    sent = upstream.last_payload["messages"]
+    assert len(sent) == 2
+    merged = sent[1]["content"]
+    assert isinstance(merged, list)
+    assert {"type": "text", "text": "partial answer"} in merged
+    assert parts[1] in merged                           # image part survives

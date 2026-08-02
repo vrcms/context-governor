@@ -46,6 +46,30 @@ class ProxyConfig:
             byte-stable and the upstream's KV/prefix cache is actually reused
             (compute saving, not just tokens). Must be < context_budget_ratio.
             0 = legacy behavior (page to the ceiling every turn).
+        context_emergency_ratio: the THIRD (HIGH) water, ABOVE
+            context_budget_ratio, added 2026-07-28. Together the three form
+            LOW (context_target_ratio) / MID (context_budget_ratio, the
+            existing trigger+ceiling) / HIGH (this field) — the field keeps its
+            original name for backward compatibility, but functions as the MID
+            water once this is set. 0 (default) disables the emergency tier
+            entirely: behavior is UNCHANGED from before this field existed.
+            RATIONALE (measured 2026-07-28): the normal trigger can LATCH — if
+            a shed pass cannot reach the low water (unsheddable mass: a raw
+            multimodal content-parts message, or before the 2026-07-28 fix,
+            large tool_calls arguments), it holds the wire steady rather than
+            re-breaking the prefix for nothing, and waits for pressure to grow
+            by the hysteresis gap before trying again. On one live session that
+            let real pressure climb to 96% of n_ctx while latched, because the
+            gap-based re-arm didn't fire fast enough relative to growth. When
+            pressure crosses `context_emergency_ratio * n_ctx`, the governor
+            OVERRIDES the latch and forces a shed attempt every request
+            regardless — a hard "you must keep trying" floor that costs at
+            most an extra prefix break with no benefit (the same cost a normal
+            first trigger already pays) but can recover newly-eligible mass a
+            latched conversation would otherwise never re-attempt. Set this
+            BELOW the host harness's own compaction line (opencode's default
+            is ~0.75 * n_ctx) so the emergency shed always gets a chance to act
+            before the harness's own lossy compaction does.
         protect_first_n / protect_last_n: messages at the head (system/spec) and the
             recent tail that budget-windowing never pages out (pinned + recent window).
         model_alias: if set (default "context-governor"), the proxy presents the
@@ -110,6 +134,23 @@ class ProxyConfig:
         loop_hard_stop: when True, a cycle that survives TWO injected notices is
             ended with a synthetic final response (the proxy answers instead of
             the model). OFF by default.
+        diag_enabled: measure the outgoing wire's composition per component
+            (tools / system / string content / content-parts / tool_calls) and
+            pair it with the real usage.prompt_tokens of the SAME request; read
+            it at /diagnostics. Char counts only, so the cost is len() plus one
+            compact serialization of the non-string parts. ON by default —
+            without it, every claim about where the prompt mass lives (and
+            therefore every decision about what to shed) is inference.
+        diag_tokenize: additionally issue exact /tokenize calls per component
+            (6 per sampled request) so the UNACCOUNTED chat-template residual
+            can be computed rather than estimated. OFF by default — it adds
+            upstream round-trips to the request path.
+        diag_max_samples: ring size for retained samples.
+        wire_capture_dir: when set, dump every request as received AND the exact
+            payload forwarded upstream to req-<seq>-{in,out}.json files in this
+            directory (headers redacted), so consecutive turns can be diffed
+            offline to attribute prefix breaks — the measured answer to
+            own-mutation vs harness-edit. None (default) = capture off.
     """
 
     upstream_base_url: str
@@ -136,6 +177,7 @@ class ProxyConfig:
     handle_threshold_ratio: float = 0.02
     context_budget_ratio: float = 0.50
     context_target_ratio: float = 0.35
+    context_emergency_ratio: float = 0.0
     protect_first_n: int = 2
     protect_last_n: int = 6
     auto_recall_k: int = 3
@@ -151,6 +193,10 @@ class ProxyConfig:
     loop_draft_n_min: int = 200
     loop_cooldown_turns: int = 3
     loop_hard_stop: bool = False
+    diag_enabled: bool = True
+    diag_tokenize: bool = False
+    diag_max_samples: int = 64
+    wire_capture_dir: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.handle_threshold_tokens <= 0:
@@ -208,10 +254,26 @@ class ProxyConfig:
                 f"context_budget_ratio ({self.context_budget_ratio}) — the hysteresis "
                 f"gap is what keeps the wire prefix stable between triggers"
             )
+        if not (0.0 <= self.context_emergency_ratio <= 1.0):
+            raise ValueError(
+                f"context_emergency_ratio must be in 0.0..1.0 (0 disables the "
+                f"emergency latch-override tier), got {self.context_emergency_ratio}"
+            )
+        if (self.context_emergency_ratio > 0.0 and self.context_budget_ratio > 0.0
+                and self.context_emergency_ratio <= self.context_budget_ratio):
+            raise ValueError(
+                f"context_emergency_ratio ({self.context_emergency_ratio}) must be > "
+                f"context_budget_ratio ({self.context_budget_ratio}) — it is the HIGH "
+                f"water, above the existing MID-water trigger"
+            )
         if self.protect_first_n < 0:
             raise ValueError(f"protect_first_n must be >= 0, got {self.protect_first_n}")
         if self.protect_last_n < 0:
             raise ValueError(f"protect_last_n must be >= 0, got {self.protect_last_n}")
+        if self.diag_max_samples <= 0:
+            raise ValueError(
+                f"diag_max_samples must be > 0, got {self.diag_max_samples}"
+            )
         if self.auto_recall_k < 0:
             raise ValueError(f"auto_recall_k must be >= 0 (0 disables), got {self.auto_recall_k}")
         if self.recall_budget_tokens < 0:

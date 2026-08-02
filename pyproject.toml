@@ -15,7 +15,14 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: OS Independent",
 ]
-dependencies = ["httpx", "fastapi", "uvicorn", "mcp"]
+# rapidfuzz: diff-candidate scoring in the rewriter. NOT cosmetic — measured
+# 2026-07-28, difflib.SequenceMatcher on real ~20 KB store notes takes 5-17 s per
+# comparison, x6 candidates, synchronously on the request path. That was 56.6 s of
+# CPU per turn and ~66% of session wall clock. rewriter._similarity falls back to
+# difflib when it is absent, so the proxy still RUNS without it — but that path is
+# a safety net, not a supported performance configuration. 1.5 MB wheel, no
+# transitive dependencies.
+dependencies = ["httpx", "fastapi", "uvicorn", "mcp", "rapidfuzz"]
 
 [project.optional-dependencies]
 dev = ["pytest", "hypothesis", "pytest-asyncio"]

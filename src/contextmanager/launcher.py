@@ -142,6 +142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--handle-threshold-ratio", dest="handle_threshold_ratio", type=float)
     p.add_argument("--context-budget-ratio", dest="context_budget_ratio", type=float)
     p.add_argument("--context-target-ratio", dest="context_target_ratio", type=float)
+    p.add_argument("--context-emergency-ratio", dest="context_emergency_ratio", type=float)
     p.add_argument("--stub-preview-chars", dest="stub_preview_chars", type=int)
     p.add_argument("--rehydrate-budget-tokens", dest="rehydrate_budget_tokens", type=int)
     p.add_argument("--auto-recall-k", dest="auto_recall_k", type=int)
@@ -152,6 +153,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-conversations", dest="max_conversations", type=int)
     p.add_argument("--request-timeout", dest="request_timeout", type=float)
     p.add_argument("--model-alias", dest="model_alias")
+    p.add_argument("--wire-capture-dir", dest="wire_capture_dir",
+                   help="dump req-<seq>-{in,out}.json per request here (forensic diffing)")
     p.add_argument("--diff-min-similarity", dest="diff_min_similarity", type=float)
     p.add_argument("--diff-lookback", dest="diff_lookback", type=int)
     p.add_argument("--diff-max-chars", dest="diff_max_chars", type=int)

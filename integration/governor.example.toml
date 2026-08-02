@@ -8,12 +8,15 @@ listen_host = "127.0.0.1"
 listen_port = 8900
 store_root = "./contextstore"
 handle_threshold_ratio = 0.02     # anchor handle-ization to 2% of the real n_ctx (when known)
-context_budget_ratio = 0.50       # HIGH water: wire ceiling + windowing trigger (stay under the host CLI's own compaction line)
+context_budget_ratio = 0.50       # MID water: wire ceiling + windowing trigger (stay under the host CLI's own compaction line)
 context_target_ratio = 0.35       # LOW water: on trigger, cut to here in one bite; prefix stays byte-stable between triggers (KV reuse)
+context_emergency_ratio = 0.0     # HIGH water (0 = off): above MID, overrides the shed latch every request. Set below the
+                                  #   host CLI's compaction line (opencode default ~0.75) as a hard "keep retrying" floor for
+                                  #   when the normal trigger latches on unsheddable mass. Added 2026-07-28; opt-in, additive.
 auto_recall_k = 3                 # Pass-4 auto-recall: max off-wire slices injected per request (0 = off)
 recall_budget_tokens = 1500       # max tokens the recall block may occupy (~2% of a 75K window)
 recall_max_stale_tokens = 4000    # sticky recall staleness BOUND: refresh rides broken-prefix turns; only this much growth forces a break (0 = every turn = per-turn prefix break)
-ceiling_safety = 0.8              # window at this fraction of the LEARNED harness-compaction ceiling (0 = ratio-only)
+ceiling_safety = 0              # window at this fraction of the LEARNED harness-compaction ceiling (0 = ratio-only)
 max_conversations = 32            # LRU cap on per-conversation governor state (ledger, sticky blocks, frontiers)
 hotness_half_life_seconds = 86400 # memory-decay half-life; shorter = recall favors the recent working set
 diff_max_chars = 20000            # skip diff-encoding above ~20 KB (anti brain-lock)
@@ -22,6 +25,10 @@ loop_guard_enabled = true         # mechanical loop-breaker: repeated identical 
 loop_repeat_k = 3                 # consecutive near-identical turns before the breaker fires
 loop_cooldown_turns = 3           # suppress re-injection for this many turns after firing (2nd fire escalates once)
 loop_hard_stop = false            # true = after two ignored notices, end the run with a synthetic final response
+diag_enabled = true               # /diagnostics: per-component wire composition (tools / system / string content / content-parts / tool_calls) PAIRED with the real usage.prompt_tokens of the same request. Chars only = free
+diag_tokenize = false             # also exact-tokenize each component (6 /tokenize calls per request) to get the UNACCOUNTED chat-template residual. Costs upstream round-trips
+diag_max_samples = 64             # retained sample ring
+# wire_capture_dir = "C:/path/to/captures"  # forensic: dump req-<seq>-{in,out}.json per request for offline diffing (headers redacted); unset = off
 
 [providers.llama]
 upstream_base_url = "http://127.0.0.1:8080"

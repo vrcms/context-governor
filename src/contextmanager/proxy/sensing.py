@@ -24,6 +24,11 @@ with three pieces, all of them PURE TEES over data the proxy already carries:
      ``usage.prompt_tokens`` and a learned native-compaction ceiling (persisted
      in the contextstore's StateStore, keyed by harness fingerprint) so the
      governor windows (controlled, lossless) BEFORE the harness floods.
+     Calibration is hardened against false samples: learning requires the wire
+     to SHRINK (an early-message edit is not a compaction), cross-key matches
+     are confirmed temporally (a continuing new key) and retracted when the old
+     key stays alive, and any established conversation observed PAST the
+     learned ceiling uncompacted raises it (self-healing in both directions).
 
 Everything here is stdlib-only and side-effect-free with respect to the wire.
 """
@@ -44,6 +49,12 @@ _EST_CHARS_PER_TOKEN = 4
 
 # How many chars of the first message identify the harness (system-prompt head).
 _HARNESS_FP_CHARS = 2048
+
+# A head-rewrite only feeds ceiling learning when the wire SHRANK to at most
+# this fraction of its previous message count. Native compaction replaces the
+# bulk with a summary (drastic shrink); an early-message EDIT (a refreshed
+# session-state block) keeps the length and must not pose as a compaction.
+_HEAD_REWRITE_SHRINK = 0.7
 
 # Bounded per-conversation history (reuse ratios, growth) — enough for trend
 # reading on /metrics without unbounded growth.
@@ -134,6 +145,58 @@ def harness_fingerprint(messages: list) -> str:
         messages[0].get("content") if isinstance(messages[0], dict) else messages[0]
     )[:_HARNESS_FP_CHARS]
     return "hp-" + hashlib.sha1(head.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _growth_estimate(messages: list, kind: str, pos: int, chars: int,
+                     prev_chars: int, threshold: Optional[int],
+                     stub_est: Optional[int]) -> int:
+    """Estimated tokens this turn ADDS to the wire that is actually SENT.
+
+    THE BUG THIS FIXES (measured 2026-07-28). The estimate used to be a flat
+    ``(chars - prev_chars) / 4`` over the INCOMING wire. But the incoming wire is
+    not what reaches llama-server: Pass 1 pages out every message at or above the
+    handle threshold and sends a ~50-token stub in its place. On one live turn a
+    60 KB file read therefore contributed ~15,000 phantom tokens:
+
+        est_pressure 37,666   vs   real prompt 21,259
+
+    That pushed pressure past the high water, Pass 3 windowed, and windowing
+    sheds messages from ``protect_first_n`` forward — breaking the prefix and
+    forcing a full re-prefill. Two such spurious triggers were observed live
+    (``windowing_triggers: 2`` matching ``own-mutation: 2``); the 14b latch
+    suppressed three more.
+
+    THE FIX is to estimate each appended message at what it will COST ON THE
+    WIRE: content at or above the threshold becomes a stub, so it counts as
+    ``stub_est``, not as its own size. Everything else counts at chars/4 as
+    before. ``tool_calls`` payloads are never stubbed, so they always count in
+    full.
+
+    Note this is still a cheap PRE-GATE, not a precise count — it deliberately
+    makes no tokenizer calls. Residual error is on the order of tens of tokens
+    per turn (stub-size approximation, and Pass 2 rehydration, which is bounded
+    by ``rehydrate_budget_tokens`` and can add content the incoming wire lacks).
+    Verifying against the post-Pass-1 wire before shedding is the precise
+    follow-up, deliberately deferred.
+
+    Falls back to the legacy aggregate when the rewriter's settings are unknown,
+    or on any non-append turn (tail edits, mid-wire edits, head rewrites), where
+    there is no well-defined "appended region" — those turns are rare and usually
+    already carry a flush.
+    """
+    legacy = max(0, (chars - prev_chars) // _EST_CHARS_PER_TOKEN)
+    if threshold is None or stub_est is None or kind != KIND_APPEND:
+        return legacy
+    est = 0
+    for m in messages[pos:]:
+        if not isinstance(m, dict):
+            continue
+        body = len(canonical_content(m.get("content"))) // _EST_CHARS_PER_TOKEN
+        est += stub_est if body >= threshold else body
+        if m.get("tool_calls") is not None:
+            est += (len(canonical_content(m.get("tool_calls")))
+                    // _EST_CHARS_PER_TOKEN)
+    return max(0, est)
 
 
 # ---------------------------------------------------------------- classifier
@@ -296,10 +359,20 @@ class GovernorController:
         self._max = max(1, int(max_conversations))
         self._breaks: Counter = Counter()
         self._native_compactions = 0
-        # harness_fp -> {"ceiling": int, "observations": int, "last_sample": int,
-        #                "updated_at": float}
+        # harness_fp -> {"ceiling": int, "observations": int, "raised": int,
+        #                "last_sample": int, "updated_at": float}
         self._profiles: dict = {}
         self._profiles_dirty = False
+        # Deferred cross-key ceiling samples: new_conv_key -> {"sample", "old_key",
+        # "fp", "at"}. A cross-key head-rewrite is only a SUSPECTED compaction
+        # (a side-call sharing the system head has the same wire shape — the
+        # false-ceiling incident of 2026-07-19); the sample is promoted to a
+        # learned ceiling only when the new key proves to be a CONTINUING
+        # conversation (a later pure-append turn), and retracted if the old key
+        # turns out to be alive (side-calls coexist with their parent; a true
+        # compaction kills it). In-memory only: a pending sample dies with the
+        # proxy rather than being persisted unconfirmed.
+        self._pending_ceiling: "OrderedDict[str, dict]" = OrderedDict()
         self._last_prompt_tokens = 0
         self._peak_prompt_tokens = 0
         self._last_reuse_ratio: Optional[float] = None
@@ -317,9 +390,18 @@ class GovernorController:
             self._ledger.popitem(last=False)
         return entry
 
-    def observe_request(self, messages: list) -> RequestObservation:
+    def observe_request(self, messages: list, *,
+                        handle_threshold_tokens: Optional[int] = None,
+                        stub_tokens_est: Optional[int] = None,
+                        ) -> RequestObservation:
         """Classify the incoming wire against this conversation's last one and
-        update the ledger's request-side state. Runs BEFORE forwarding."""
+        update the ledger's request-side state. Runs BEFORE forwarding.
+
+        ``handle_threshold_tokens`` / ``stub_tokens_est`` let the 14c pressure
+        estimate account for the rewrite that is about to happen — see
+        `_growth_estimate`. Both omitted (the default) keeps the legacy aggregate
+        estimate, so callers that do not know the rewriter's settings, and the
+        existing tests, are unaffected."""
         key = conversation_key(messages)
         sig = wire_signature(messages)
         fp = harness_fingerprint(messages)
@@ -327,7 +409,8 @@ class GovernorController:
                     for m in messages if isinstance(m, dict))
         with self._lock:
             entry = self._entry(key)
-            kind, pos = classify_wire_diff(entry.incoming_sig or None, sig)
+            prev_sig = entry.incoming_sig
+            kind, pos = classify_wire_diff(prev_sig or None, sig)
 
             # Cross-key compaction detection: native compaction usually REPLACES
             # the first user message (system head + summary + recent tail), which
@@ -336,6 +419,10 @@ class GovernorController:
             # Match the shared system head against recent ledger entries; the
             # >=3-message guard filters the genuinely-fresh-chat shape
             # ([system, user]) that would otherwise false-positive.
+            # The match only BANKS a deferred sample (see _pending_ceiling): a
+            # side-call sharing the system head has the exact same wire shape,
+            # so same-turn evidence cannot separate the two — confirmation is
+            # temporal, not structural.
             ceiling_source: Optional[ConvEntry] = None
             if kind == KIND_NEW and len(sig) >= 3:
                 for other_key in reversed(self._ledger):
@@ -347,11 +434,20 @@ class GovernorController:
                     if cand.incoming_sig[0] != sig[0]:
                         continue
                     k2, p2 = classify_wire_diff(cand.incoming_sig, sig)
-                    if k2 == KIND_HEAD_REWRITE:
-                        kind, pos, ceiling_source = KIND_HEAD_REWRITE, p2, cand
+                    if k2 == KIND_HEAD_REWRITE and self._shrank(sig, cand.incoming_sig):
+                        kind, pos = KIND_HEAD_REWRITE, p2
+                        self._bank_pending_ceiling(
+                            key, sample=cand.last_prompt_tokens,
+                            old_key=other_key, fp=cand.harness_fp or fp,
+                        )
                         break
             elif kind == KIND_HEAD_REWRITE and entry.last_prompt_tokens > 0:
-                ceiling_source = entry
+                # Same-key compaction must SHRINK the wire: an early-message
+                # edit (a harness refreshing a session-state block) diverges in
+                # the first quarter but keeps the length — it is not a
+                # compaction and must not lower the ceiling.
+                if self._shrank(sig, prev_sig):
+                    ceiling_source = entry
 
             # Cause attribution. Multimodal content anywhere in/after the diff
             # region marks an expected-break turn (images re-encode; content the
@@ -377,29 +473,42 @@ class GovernorController:
             # flood point). Multimodal-attributed breaks never feed learning.
             if (kind == KIND_HEAD_REWRITE and cause == CAUSE_HARNESS
                     and ceiling_source is not None):
-                sample = ceiling_source.last_prompt_tokens
-                fp_key = ceiling_source.harness_fp or fp
-                prof = self._profiles.get(fp_key)
-                if prof is None:
-                    prof = {"ceiling": sample, "observations": 0}
-                prof["ceiling"] = min(int(prof.get("ceiling", sample)), sample)
-                prof["observations"] = int(prof.get("observations", 0)) + 1
-                prof["last_sample"] = sample
-                prof["updated_at"] = time.time()
-                self._profiles[fp_key] = prof
-                self._profiles_dirty = True
-                self._native_compactions += 1
+                self._learn_ceiling(ceiling_source.harness_fp or fp,
+                                    ceiling_source.last_prompt_tokens)
+
+            # Deferred cross-key samples: CONFIRM when the suspected-compacted
+            # conversation proves alive (a pure-append turn at >= its 2nd
+            # request); otherwise drop it — a one-turn side-call never
+            # confirms. The banking turn itself has entry.turns == 0 and is
+            # skipped, so a fresh pending survives to be judged later.
+            pend = self._pending_ceiling.get(key)
+            if pend is not None and entry.turns >= 1:
+                if kind == KIND_APPEND:
+                    self._learn_ceiling(pend["fp"], pend["sample"])
+                del self._pending_ceiling[key]
+            # RETRACTION: the OLD key reappearing with a pure append means it
+            # was never compacted — any pending sample reading its head-rewrite
+            # as a compaction was a side-call false positive.
+            if kind == KIND_APPEND:
+                for pk, p in list(self._pending_ceiling.items()):
+                    if p["old_key"] == key:
+                        del self._pending_ceiling[pk]
 
             # 14c pressure: this turn's real prompt will be ~ last real prompt
-            # + last completion (now part of history) + the new growth. Growth
-            # is the only estimated term — absolute mass (tools, template,
-            # content-parts) is already inside last_prompt_tokens.
+            # + the new growth. Growth is the only estimated term — absolute mass
+            # (tools, template, content-parts) is already inside
+            # last_prompt_tokens.
+            #
+            # `last_completion_tokens` is deliberately NOT added: on an append
+            # turn the completion is part of the appended region and is already
+            # counted there, and on the aggregate fallback it is inside the char
+            # delta. Adding it again was a systematic double-count.
             pressure: Optional[int] = None
             if entry.last_prompt_tokens > 0:
-                growth_est = max(0, (chars - entry.incoming_chars)
-                                 // _EST_CHARS_PER_TOKEN)
-                pressure = (entry.last_prompt_tokens
-                            + entry.last_completion_tokens + growth_est)
+                pressure = entry.last_prompt_tokens + _growth_estimate(
+                    messages, kind, pos, chars, entry.incoming_chars,
+                    handle_threshold_tokens, stub_tokens_est,
+                )
 
             entry.incoming_sig = sig
             entry.incoming_chars = chars
@@ -459,6 +568,22 @@ class GovernorController:
                 self._last_prompt_tokens = prompt_tokens
                 if prompt_tokens > self._peak_prompt_tokens:
                     self._peak_prompt_tokens = prompt_tokens
+                # 14c contradiction check: an established conversation sailing
+                # PAST the learned ceiling uncompacted falsifies that ceiling
+                # (a false-positive head-rewrite sample would otherwise poison
+                # the high water forever — the 2026-07-19 incident). RAISE the
+                # ceiling to the observed size; a later TRUE head-rewrite
+                # re-lowers it via min-sample, so the check is self-healing in
+                # both directions. turns >= 2: a fresh conversation's first
+                # prompt (e.g. a subagent seeded with bulk context) says
+                # nothing about the harness's steady-state compaction point.
+                prof = self._profiles.get(entry.harness_fp)
+                if (prof is not None and entry.turns >= 2
+                        and prompt_tokens > _as_int(prof.get("ceiling"))):
+                    prof["ceiling"] = prompt_tokens
+                    prof["raised"] = _as_int(prof.get("raised")) + 1
+                    prof["updated_at"] = time.time()
+                    self._profiles_dirty = True
             if completion_tokens > 0:
                 entry.last_completion_tokens = completion_tokens
             self._responses_observed += 1
@@ -474,6 +599,42 @@ class GovernorController:
                     entry.last_prompt_ms = prompt_ms
 
     # ------------------------------------------------------- 14c calibration
+    @staticmethod
+    def _shrank(sig: list, prev_sig: list) -> bool:
+        """True iff the wire SHRANK enough to be a plausible compaction (the
+        bulk replaced by a summary), not merely an early-message edit."""
+        return bool(prev_sig) and len(sig) <= int(_HEAD_REWRITE_SHRINK * len(prev_sig))
+
+    def _bank_pending_ceiling(self, new_key: str, *, sample: int, old_key: str,
+                              fp: str) -> None:
+        """Park a SUSPECTED cross-key compaction sample for temporal
+        confirmation (LRU-bounded like the ledger)."""
+        self._pending_ceiling[new_key] = {
+            "sample": int(sample), "old_key": old_key, "fp": fp,
+            "at": time.time(),
+        }
+        self._pending_ceiling.move_to_end(new_key)
+        while len(self._pending_ceiling) > self._max:
+            self._pending_ceiling.popitem(last=False)
+
+    def _learn_ceiling(self, fp_key: str, sample: int) -> None:
+        """Min-keep one native-compaction ceiling sample for a harness
+        fingerprint (callers hold the lock)."""
+        sample = int(sample)
+        if sample <= 0:
+            return
+        prof = self._profiles.get(fp_key)
+        if prof is None:
+            prof = {"ceiling": sample, "observations": 0, "raised": 0}
+        prof["ceiling"] = min(_as_int(prof.get("ceiling")), sample) \
+            if _as_int(prof.get("ceiling")) > 0 else sample
+        prof["observations"] = _as_int(prof.get("observations")) + 1
+        prof["last_sample"] = sample
+        prof["updated_at"] = time.time()
+        self._profiles[fp_key] = prof
+        self._profiles_dirty = True
+        self._native_compactions += 1
+
     def effective_high_water(self, n_ctx: Optional[int], budget_ratio: float,
                              ceiling_safety: float, harness_fp: str) -> Optional[int]:
         """The windowing HIGH water this turn:
@@ -551,9 +712,11 @@ class GovernorController:
                                      if self._last_reuse_ratio is not None else None),
                 "breaks_by_cause": dict(self._breaks),
                 "native_compaction_observed": self._native_compactions,
+                "pending_ceiling_samples": len(self._pending_ceiling),
                 "learned_ceilings": {
                     fp: {"ceiling": _as_int(p.get("ceiling")),
-                         "observations": _as_int(p.get("observations"))}
+                         "observations": _as_int(p.get("observations")),
+                         "raised": _as_int(p.get("raised"))}
                     for fp, p in self._profiles.items()
                 },
                 "responses_observed": self._responses_observed,

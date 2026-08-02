@@ -15,8 +15,9 @@ from ..loop_guard import LoopGuard, LoopGuardConfig, LoopGuardDecision, hard_sto
 from ..tokenizer import LlamaServerTokenCounter
 from ..types import TokenCounter
 from .config import ProxyConfig
+from .diagnostics import WireCapture, WireDiagnostics
 from .metrics import StatsCollector
-from .rewriter import PromptRewriter, RewriteResult
+from .rewriter import PromptRewriter, RewriteResult, normalize_volatile_stamps
 from .sensing import GovernorController, StreamTee, extract_usage_timings
 from .upstream import UpstreamClient, UpstreamError
 
@@ -96,6 +97,21 @@ def _sum_content_chars(messages: list) -> int:
     return total
 
 
+def _prompt_tokens_of(observed: Optional[dict]) -> Optional[int]:
+    """``usage.prompt_tokens`` out of an extract_usage_timings() result — the
+    upstream's own count of what it actually tokenized. None when absent."""
+    if not isinstance(observed, dict):
+        return None
+    usage = observed.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("prompt_tokens")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def build_loop_guard(config: ProxyConfig) -> Optional[LoopGuard]:
     """Construct the Phase 13 loop-breaker from the proxy config; None = disabled."""
     if not config.loop_guard_enabled:
@@ -173,6 +189,52 @@ def _invalid_request(message: str) -> JSONResponse:
         status_code=400,
         media_type="application/json",
     )
+
+
+def _merge_trailing_assistant_run(messages: list) -> tuple:
+    """Collapse a TRAILING run of >=2 assistant messages into one.
+
+    llama-server's template preflight rejects such wires outright
+    (``Cannot have 2 or more assistant messages at the end of the list`` —
+    observed live 2026-07-20 when a harness's continue/retry stitching left
+    [..., assistant, assistant] at the tail; the run died on a 400). The proxy
+    never produces assistant messages itself, so this is boundary repair of
+    the HARNESS's wire: merge text contents (or concatenate content-parts
+    lists) into a single assistant message. Tail-only, deterministic, nothing
+    dropped — and the prefix up to the run stays byte-stable for the
+    upstream's prompt cache. Runs carrying ``tool_calls`` are left untouched
+    (their payloads cannot be merged coherently — upstream's verdict stands).
+
+    Returns ``(messages, merged_run_length)``; ``merged_run_length`` is 0 when
+    no merge happened.
+    """
+    if len(messages) < 2:
+        return messages, 0
+    i = len(messages)
+    while (i > 0 and isinstance(messages[i - 1], dict)
+           and messages[i - 1].get("role") == "assistant"):
+        i -= 1
+    run = len(messages) - i
+    if run < 2:
+        return messages, 0
+    tail = messages[i:]
+    if any(m.get("tool_calls") for m in tail):
+        return messages, 0
+    texts: list[str] = []
+    parts: list = []
+    structured = False
+    for m in tail:
+        c = m.get("content")
+        if isinstance(c, str):
+            if c:
+                texts.append(c)
+                parts.append({"type": "text", "text": c})
+        elif isinstance(c, list):
+            structured = True
+            parts.extend(p for p in c if isinstance(p, dict))
+        # content None -> nothing to carry over
+    merged = {**tail[-1], "content": parts if structured else "\n".join(texts)}
+    return [*messages[:i], merged], run
 
 
 def create_app(
@@ -281,6 +343,19 @@ def create_app(
     # In-memory observability (Phase 5 §3). Set here (not only in the lifespan)
     # so it exists in injected-test mode too, where ASGITransport skips lifespan.
     app.state.stats = StatsCollector()
+    # Wire-composition tee: per-component sizes of the FORWARDED payload paired
+    # with the real usage.prompt_tokens of that same request. /metrics reports
+    # peak_chars_out and real_prompt_tokens.peak as independent maxima over
+    # DIFFERENT requests, so their difference is meaningless; this is the
+    # measured answer to "where does the prompt mass actually live".
+    app.state.diagnostics = WireDiagnostics(
+        enabled=config.diag_enabled,
+        max_samples=config.diag_max_samples,
+        tokenize=config.diag_tokenize,
+    )
+    # Forensic wire capture (in + out payloads per request, diffable offline).
+    # Gated on config; disabled = a None check per request.
+    app.state.capture = WireCapture(config.wire_capture_dir)
     # Phase 14 closed loop: per-conversation sensing ledger, request-diff
     # classifier, break attribution, learned harness ceilings. Created here so
     # it exists in injected-test mode too; profiles load in the lifespan.
@@ -313,6 +388,27 @@ def create_app(
         if not isinstance(messages, list):
             return _invalid_request("'messages' must be a list")
 
+        # Forensic tee: the request AS RECEIVED, before any pass touches it.
+        # Best-effort — a capture failure must never fail a request.
+        capture = getattr(app.state, "capture", None)
+        capture_seq = None
+        if capture is not None:
+            try:
+                capture_seq = capture.record_in(request.headers, body)
+            except Exception:
+                capture_seq = None
+
+        # Pass -1: blank per-request telemetry stamps (Claude Code's billing-header
+        # nonce) BEFORE anything reads the wire. Order matters and is load-bearing:
+        # record_in above keeps the RAW request as forensic truth, while sensing,
+        # the loop guard and the rewrite below all see ONE normalized wire — so the
+        # conversation key is derived from exactly the bytes that get forwarded and
+        # the two can never drift apart. See rewriter.normalize_volatile_stamps.
+        try:
+            messages = normalize_volatile_stamps(messages)
+        except Exception:
+            pass  # fail open: a normalization bug must never fail a request
+
         # Phase 13: observe the ORIGINAL transcript (pre-rewrite — independent of
         # stubbing/store state) and decide whether this turn needs a breaker.
         guard: Optional[LoopGuard] = app.state.loop_guard
@@ -337,7 +433,19 @@ def create_app(
         high_water: Optional[int] = None
         if controller is not None:
             try:
-                obs = controller.observe_request(messages)
+                # Hand sensing the rewriter's settings so the pressure estimate
+                # models the wire that will actually be SENT (post-Pass-1), not
+                # the raw incoming one. Without this a bulky tool result is
+                # counted at chars/4 even though it leaves as a stub — measured
+                # at 37,666 estimated vs 21,259 real, which tripped windowing
+                # and broke the prefix for nothing.
+                obs = controller.observe_request(
+                    messages,
+                    handle_threshold_tokens=resolve_handle_threshold(
+                        cfg, app.state.n_ctx),
+                    stub_tokens_est=PromptRewriter.stub_tokens_estimate(
+                        cfg.stub_preview_chars),
+                )
                 # Windowing setpoints only when windowing is enabled at all —
                 # a learned ceiling must never resurrect a feature the user
                 # disabled with context_budget_ratio = 0.
@@ -370,7 +478,23 @@ def create_app(
             # rewriter's synthetic messages).
             out_messages = [*out_messages,
                             {"role": "user", "content": decision.breaker_text}]
+        # Boundary repair AFTER all passes (incl. the breaker tail — a trailing
+        # breaker user message already ends any assistant run): llama-server
+        # 400s wires ending in >=2 assistant messages. Tail-only merge; like
+        # the breaker, deliberately NOT folded into note_sent's sent_sig below
+        # (transient tail surgery, else next turn reads a phantom tail-edit
+        # own-mutation).
+        out_messages, tail_merged = _merge_trailing_assistant_run(out_messages)
         payload = {**body, "messages": out_messages}
+
+        # The exact payload about to be forwarded, paired with the incoming
+        # capture by seq — diffing in-vs-in and out-vs-out across turns is what
+        # attributes a prefix break to the harness or to our own rewrite.
+        if capture is not None and capture_seq is not None:
+            try:
+                capture.record_out(capture_seq, payload)
+            except Exception:
+                pass
 
         # Phase 14a: record the REWRITER's wire for break attribution (a prefix
         # break the incoming wire did not already carry is an own-mutation, the
@@ -394,10 +518,31 @@ def create_app(
             messages_rehydrated=len(result.rehydrated_handles),
             slices_recalled=len(result.recalled_handles),
             windowing_triggered=result.windowing_triggered,
+            windowing_emergency=result.windowing_emergency,
             loop_injected=decision is not None and decision.breaker_text is not None,
+            assistant_tail_merged=tail_merged > 0,
             chars_in=_sum_content_chars(messages),
             chars_out=_sum_content_chars(out_messages),
         )
+
+        # Wire-composition tee. Measures the FINAL forwarded payload (after every
+        # rewrite pass, the breaker tail and the boundary repair), so what it
+        # reports is literally what llama-server tokenizes. Returns a seq the
+        # response path pairs usage.prompt_tokens against — same request, which
+        # is the whole point. Best-effort: a diagnostic must never fail a request.
+        diag = getattr(app.state, "diagnostics", None)
+        diag_seq = None
+        try:
+            if diag is not None:
+                diag_seq = diag.record_request(payload)
+                if diag.tokenize and diag_seq is not None:
+                    # 6 upstream /tokenize round-trips — off the event loop, and
+                    # under no lock (the counter is independent of the store's
+                    # sqlite connections).
+                    await asyncio.to_thread(diag.tokenize_request, diag_seq,
+                                            payload, app.state.counter)
+        except Exception:
+            diag_seq = None
 
         upstream_client: UpstreamClient = app.state.upstream
 
@@ -442,9 +587,17 @@ def create_app(
                         guard.observe_stream_chunk(chunk)
                     tee.feed(chunk)
                     yield chunk
+                # Parsed once: the diagnostic tee and the controller read the
+                # same observation, so they can never disagree about this turn.
+                observed = tee.result()
+                if diag is not None:
+                    try:
+                        diag.attach_usage(diag_seq, _prompt_tokens_of(observed))
+                    except Exception:
+                        pass
                 if controller is not None and obs is not None:
                     try:
-                        controller.observe_response(obs.key, tee.result(),
+                        controller.observe_response(obs.key, observed,
                                                     ttft_ms=ttft_ms)
                         if app.state.store is not None:
                             controller.maybe_persist(app.state.store.state)
@@ -462,9 +615,15 @@ def create_app(
         # Phase 14a response tee (non-stream): the body is already a parsed
         # dict; fold usage/timings into the ledger. Best-effort, response
         # forwarded unchanged either way.
+        observed = extract_usage_timings(data)
+        if diag is not None:
+            try:
+                diag.attach_usage(diag_seq, _prompt_tokens_of(observed))
+            except Exception:
+                pass
         if controller is not None and obs is not None:
             try:
-                controller.observe_response(obs.key, extract_usage_timings(data))
+                controller.observe_response(obs.key, observed)
                 if app.state.store is not None:
                     controller.maybe_persist(app.state.store.state)
             except Exception:
@@ -483,6 +642,39 @@ def create_app(
         data = _apply_model_alias(data, app.state.config.model_alias)
         data = _inject_context_length(data, app.state.n_ctx)
         return JSONResponse(data, media_type="application/json")
+
+    @app.get("/v1/models/{model_id}")
+    async def retrieve_model(model_id: str):
+        # OpenAI retrieve-model shape: ONE model object. llama-server has no
+        # such route, so harnesses that probe it (hermes-agent probing
+        # /v1/models/context-governor, live 2026-07-20) ate a bare FastAPI 404.
+        # Synthesize the reply from the upstream's model list — the SAME data
+        # /v1/models serves (alias + real context_length applied) — narrowed to
+        # the probed id.
+        upstream_client: UpstreamClient = app.state.upstream
+        try:
+            data = await upstream_client.passthrough_get("/v1/models")
+        except UpstreamError as e:
+            return _upstream_error_response(e)
+        data = _apply_model_alias(data, app.state.config.model_alias)
+        data = _inject_context_length(data, app.state.n_ctx)
+        items = data.get("data") if isinstance(data, dict) else None
+        if not (isinstance(items, list) and items and isinstance(items[0], dict)):
+            items = data.get("models") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and model_id in (
+                        it.get("id"), it.get("name"), it.get("model")):
+                    return JSONResponse(dict(it), media_type="application/json")
+        return JSONResponse(
+            {"error": {
+                "message": f"The model '{model_id}' does not exist",
+                "type": "invalid_request_error",
+                "code": "model_not_found",
+            }},
+            status_code=404,
+            media_type="application/json",
+        )
 
     @app.get("/props")
     @app.get("/v1/props")
@@ -567,6 +759,21 @@ def create_app(
                 snap["closed_loop"] = ctrl.snapshot()
             except Exception:
                 pass
+        return JSONResponse(snap, media_type="application/json")
+
+    # ------------------------------------------------------------- /diagnostics
+
+    @app.get("/diagnostics")
+    async def diagnostics():
+        # Wire composition per component, PAIRED per request with the real
+        # usage.prompt_tokens. Unlike /metrics (independent running maxima),
+        # every figure here comes from a single forwarded request, so the
+        # component split is arithmetic rather than inference. Does NOT touch
+        # upstream.
+        try:
+            snap = app.state.diagnostics.snapshot(app.state.n_ctx)
+        except Exception as e:
+            snap = {"enabled": False, "error": f"{type(e).__name__}: {e}"}
         return JSONResponse(snap, media_type="application/json")
 
     return app

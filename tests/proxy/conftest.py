@@ -46,6 +46,7 @@ class FakeUpstream:
         stream_chunks: Optional[list[bytes]] = None,
         error: Optional[Exception] = None,
         notfound: Optional[set] = None,
+        get_responses: Optional[dict] = None,
     ) -> None:
         self.response: dict = (
             response if response is not None else {"id": "x", "choices": []}
@@ -55,6 +56,8 @@ class FakeUpstream:
         # Paths for which passthrough_get raises a 404 UpstreamError (simulates an
         # upstream that doesn't implement that route, e.g. llama-server + /api/*).
         self.notfound: set = set(notfound) if notfound else set()
+        # Per-path canned passthrough payloads (e.g. a realistic /v1/models list).
+        self.get_responses: dict = dict(get_responses) if get_responses else {}
         self.last_payload: Optional[dict] = None
         self.last_stream_payload: Optional[dict] = None
         self.call_count: int = 0
@@ -84,6 +87,8 @@ class FakeUpstream:
             from contextmanager.proxy.upstream import UpstreamError
 
             raise UpstreamError(f"HTTP 404 from {path}", status_code=404)
+        if path in self.get_responses:
+            return self.get_responses[path]
         return {"ok": True, "path": path}
 
     async def aclose(self) -> None:
@@ -151,6 +156,7 @@ def make_app(tmp_path):
         stream_chunks: Optional[list[bytes]] = None,
         error: Optional[Exception] = None,
         notfound: Optional[set] = None,
+        get_responses: Optional[dict] = None,
         config: Optional[ProxyConfig] = None,
         store: Optional[DurableStore] = None,
         counter: Optional[FakeCounter] = None,
@@ -166,7 +172,8 @@ def make_app(tmp_path):
         if rewriter is None:
             rewriter = PromptRewriter(config, counter, store)
         upstream = FakeUpstream(
-            response=response, stream_chunks=stream_chunks, error=error, notfound=notfound
+            response=response, stream_chunks=stream_chunks, error=error,
+            notfound=notfound, get_responses=get_responses,
         )
 
         app = create_app(config)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -26,8 +27,54 @@ from typing import Optional
 
 from ..types import Message, TokenCounter
 from ..durable import DurableStore
-from .recall import extract_query, select_diverse
+from .recall import extract_query, select_diverse, similarity_ratio
+from .recall import _Indel  # re-exported: tests assert the accelerator is wired
 from .sensing import canonical_content, conversation_key
+
+
+def _similarity(base: str, content: str) -> float:
+    """Normalized similarity in [0,1] used to pick a diff-encoding base.
+
+    Thin wrapper over `recall.similarity_ratio`, which is the single shared
+    implementation (it lives there because `rewriter` imports `recall`, so the
+    reverse would be circular). Full rationale and measurements are in that
+    function's docstring; the diff-encoding specifics are below.
+
+    WHY THIS EXISTS (measured 2026-07-28 on real store notes, ~19-20 KB each —
+    exactly the size that reaches this code path under `diff_max_chars`):
+
+        pair                difflib      rapidfuzz     speedup
+        19898 x 19703        9.26 s       0.0109 s        851x
+        19898 x 19449        8.41 s       0.0106 s        793x
+        19703 x 19449       17.22 s       0.0091 s       1893x
+                                          overall         981x
+
+    `difflib.SequenceMatcher` is O(n*m) in pure Python, and this runs
+    SYNCHRONOUSLY on the request path. At `diff_lookback = 6` that is up to ~60 s
+    of CPU per eligible message — which matched, almost exactly, the 56.6 s of
+    governor CPU measured during a single 97 s "dead wait" where llama-server sat
+    idle and the client was blocked. Two thirds of session wall-clock was going
+    here.
+
+    METRICS AGREE WHERE IT MATTERS. Indel normalized similarity and
+    Ratcliff-Obershelp differ on unrelated documents (0.05 vs 0.33), but there
+    both are far below any sane threshold and the decision is identical. On the
+    case this feature exists for — a file re-read after an edit — they agree to
+    3-4 decimals:
+
+        edits:      0       1       3      10      50     200
+        difflib   1.0000  0.9996  0.9968  0.9895  0.9408  0.7587
+        rapidfuzz 1.0000  0.9996  0.9969  0.9896  0.9432  0.7692
+
+    So `diff_min_similarity` keeps its meaning and needed no recalibration.
+    `tests/proxy/test_diff_similarity.py` pins that agreement so a future
+    rapidfuzz release cannot silently move the decision boundary.
+
+    NOTE: `difflib.unified_diff` (used to RENDER the delta) is deliberately left
+    alone — it matches on lines, not characters, so its n is ~3 orders of
+    magnitude smaller and it was never part of the cost.
+    """
+    return similarity_ratio(base, content)
 
 
 # Regex matching the opening line of a stub (spec §3.1). The handle is captured;
@@ -77,6 +124,109 @@ _DIFF_BASE_RE = re.compile(
     r"\[\[cm:diff handle=[A-Za-z0-9._-]+ base=(?P<h>[A-Za-z0-9._-]+)"
 )
 
+# ------------------------------------------------- Pass -1: volatile stamps
+# Some harnesses stamp PER-REQUEST telemetry into the system prompt. Claude Code
+# 2.1.x (through LiteLLM) sends messages[0].content as content-parts whose FIRST
+# part is nothing but a billing header — measured 2026-07-28 from a live wire
+# capture:
+#     part0 (81 chars): "x-anthropic-billing-header: cc_version=2.1.119.af2;
+#                        cc_entrypoint=cli; cch=9b25f;"
+#     part1 (57 chars): "You are Claude Code, Anthropic's official CLI for Claude."
+#     part2 (25815)   : the actual system prompt
+# `cch` changes on EVERY request (9b25f / cdb12 / 88fab observed in one session)
+# and `cc_version` flips its build suffix (af2 / c72) within a single session.
+#
+# WHY THIS MATTERS TWICE. Two independent failures both trace to this nonce:
+#   1. IDENTITY — conversation_key() hashes messages[0], so the key churned every
+#      turn. Every request was filed as a new conversation, which forced
+#      prefix_broken=True, which made the rewriter FLUSH its frozen recall block
+#      and rebuild it at the tail each turn (the ~16752-token divergence point in
+#      the server log). All per-conversation state was dead: sticky recall, the
+#      windowing ledger, hysteresis, the learned ceiling.
+#   2. WIRE — even with a perfect key, the nonce is still FORWARDED. On a hybrid
+#      SSM/recurrent model, cache reuse needs a byte-exact prefix, so a differing
+#      char 94 forces a full re-prefill from token ~24 regardless of identity.
+# An earlier attempt normalized only for hashing (case 1) and still saw full
+# re-processing, because case 2 was untouched. Normalizing the WIRE at ingress
+# fixes both at once: identity is derived from the same normalized bytes that
+# are forwarded, so the two can never drift apart.
+#
+# SCOPE IS DELIBERATELY NARROW: system messages only, only when the marker is
+# present in the leading window, only the two measured-volatile VALUES.
+# `cc_entrypoint` keeps its value on purpose — it distinguishes cli / sdk /
+# vscode sessions and is a legitimate identity discriminator. Unknown patterns
+# are NOT stripped; blind normalization would eat real content (dates, versions
+# the model legitimately needs).
+_BILLING_HEADER_MARKER = "x-anthropic-billing-header:"
+_BILLING_VOLATILE_RE = re.compile(r"\b(cc_version|cch)=[^;\s]*")
+# The header sits at chars 0-81. Bounding replacement to a leading window means a
+# `cch=` appearing later in real prompt content can never be touched.
+_VOLATILE_WINDOW = 512
+
+
+def _normalize_volatile_text(text) -> Optional[str]:
+    """Return normalized text, or None when nothing changed / not applicable."""
+    if not isinstance(text, str):
+        return None
+    head = text[:_VOLATILE_WINDOW]
+    if _BILLING_HEADER_MARKER not in head:
+        return None
+    new_head = _BILLING_VOLATILE_RE.sub(r"\1=", head)
+    if new_head == head:
+        return None
+    return new_head + text[_VOLATILE_WINDOW:]
+
+
+def _normalize_volatile_content(content):
+    """Normalize str content or an OpenAI content-parts list. None = unchanged."""
+    if isinstance(content, str):
+        return _normalize_volatile_text(content)
+    if isinstance(content, list):
+        new_parts = None
+        for i, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            new_text = _normalize_volatile_text(part.get("text"))
+            if new_text is None:
+                continue
+            if new_parts is None:
+                new_parts = list(content)
+            new_part = dict(part)
+            new_part["text"] = new_text
+            new_parts[i] = new_part
+        return new_parts
+    return None
+
+
+def normalize_volatile_stamps(messages: list) -> list:
+    """Blank per-request telemetry values in system messages.
+
+    PURE: returns a new list only when something changed, sharing every untouched
+    message object; the input is never mutated. Idempotent — running it twice is
+    identical to running it once. Never raises: any unexpected shape is returned
+    unchanged, which fails OPEN (the old churn resumes and is visible in
+    /metrics as breaks_by_cause={"new-conversation": N}) rather than dropping a
+    request.
+
+    MUST be called at ingress, BEFORE sensing — conversation_key() runs in
+    controller.observe_request() and hashes whatever it is handed.
+    """
+    if not isinstance(messages, list):
+        return messages
+    out = None
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        new_content = _normalize_volatile_content(msg.get("content"))
+        if new_content is None:
+            continue
+        if out is None:
+            out = list(messages)
+        new_msg = dict(msg)
+        new_msg["content"] = new_content
+        out[i] = new_msg
+    return messages if out is None else out
+
 # Rough chars-per-token used ONLY to estimate the size of content too large to send to
 # the tokenizer (the stub's `tokens=` field is informational; the decision to handle-ize
 # such content is already certain from its char length).
@@ -97,6 +247,13 @@ class RewriteResult:
         windowing_triggered: True iff Pass 3 crossed the high water this call and
             advanced the stub frontier (should be RARE — that is the point of the
             hysteresis: triggers << requests means the KV prefix is being reused).
+        windowing_emergency: True iff this trigger only happened because the
+            HIGH-water override (context_emergency_ratio) forced it — i.e. the
+            hysteresis latch WOULD have suppressed it otherwise. Always False
+            when the emergency tier is disabled (the default). Should be RARER
+            than windowing_triggered; a nonzero rate under normal operation
+            means something is chronically unsheddable and worth investigating
+            directly, not just papering over with more overrides.
     """
 
     messages: list[dict]
@@ -104,6 +261,7 @@ class RewriteResult:
     rehydrated_handles: list[str]
     recalled_handles: list[str] = field(default_factory=list)
     windowing_triggered: bool = False
+    windowing_emergency: bool = False
 
 
 class PromptRewriter:
@@ -138,6 +296,17 @@ class PromptRewriter:
         # equals the upstream's prefix-cache lifetime (a proxy restart just
         # re-derives it once). LRU-bounded by config.max_conversations.
         self._windowed: "OrderedDict[str, dict]" = OrderedDict()
+        # MISSED-LOW-WATER latch (Phase 14b hardening): conv_key -> pressure at
+        # the last windowing trigger that could NOT shed down to the low water
+        # (unsheddable mass: invisible template/tools tokens, protected tail,
+        # already-minimal stubs — paging has nothing left to give). While
+        # latched, re-triggers are SUPPRESSED until pressure grows by the
+        # hysteresis gap, converting futile per-turn prefix breaks into a
+        # byte-stable wire the upstream cache can extend. Cleared when pressure
+        # falls back below the high water (the crisis is over; a fresh trigger
+        # may well be sheddable). Never engaged when the hysteresis gap is
+        # collapsed (target 0 = legacy per-turn line).
+        self._window_latched: "OrderedDict[str, int]" = OrderedDict()
         # STICKY recall block (Phase 12), keyed PER CONVERSATION (Phase 14b —
         # one global slot thrashed across the ≥3 interleaved conversations of
         # the 2026-07-19 shakedown): conv_key -> (anchor_mid, block_text) of
@@ -217,6 +386,24 @@ class PromptRewriter:
             f"…(truncated {omitted} chars)…\n"
             f"{tail}\n{footer}"
         )
+
+    @staticmethod
+    def stub_tokens_estimate(preview_chars: int) -> int:
+        """Approximate tokens a HANDLE-IZED message costs on the sent wire.
+
+        Sized by rendering a representative stub through `make_stub` rather than
+        hard-coding a constant, so it cannot drift if the stub format changes.
+        Used by the 14c pressure estimate (`sensing.observe_request`): a message
+        at or above the handle threshold does NOT reach the upstream at its own
+        size — the rewriter pages it out and sends this instead. Estimating it at
+        `chars / 4` is what made a 60 KB tool result look like ~15,000 tokens of
+        pressure when its real contribution to the wire was ~50.
+        """
+        sample = PromptRewriter.make_stub(
+            handle="msg-0123456789abcdef", role="tool", tokens=999999,
+            content="x" * (2 * preview_chars + 1), preview_chars=preview_chars,
+        )
+        return max(1, len(sample) // _EST_CHARS_PER_TOKEN)
 
     @staticmethod
     def parse_handles(text: str) -> list[str]:
@@ -342,13 +529,11 @@ class PromptRewriter:
                 continue
             if cap and len(base) > cap:
                 continue  # same O(n*m) guard for an oversized base note
-            # autojunk=False (measured): the default heuristic marks "popular"
-            # characters as junk on strings >= 200 chars — and every diff-stub
-            # candidate is bulky by definition — collapsing a one-line file
-            # re-read from a true ~0.999 similarity to a reported ~0.51. With
-            # the default, near-duplicates routinely fell below
-            # diff_min_similarity and lost their delta encoding entirely.
-            ratio = difflib.SequenceMatcher(None, base, content, autojunk=False).ratio()
+            # See _similarity(): rapidfuzz Indel when available (~981x faster on
+            # real 20 KB store notes), exact difflib fallback otherwise. Both
+            # agree to 3-4 decimals on near-duplicates, which is the only regime
+            # where diff_min_similarity actually decides anything.
+            ratio = _similarity(base, content)
             if ratio > best_ratio:
                 best_ratio, best_handle, best_base = ratio, h, base
         if best_handle is None or best_base is None or best_ratio < self.config.diff_min_similarity:
@@ -378,6 +563,122 @@ class PromptRewriter:
         if cap and n > cap:
             return max(threshold, n // _EST_CHARS_PER_TOKEN)
         return self.counter.count_text(content)
+
+    def _handleize_tool_calls(self, tool_calls,
+                              handle_ized_ids: list) -> Optional[list]:
+        """Pass 1 extension: page out large STRING values found inside
+        ``tool_calls[].function.arguments``, mirroring the ``content`` threshold.
+
+        Returns a NEW list only when something was actually stubbed; ``None``
+        means "leave tool_calls exactly as received" — re-serializing an
+        UNCHANGED dict through ``json.dumps`` can still reorder/reformat bytes
+        the client sent, which would break prefix stability for no reason, so
+        the untouched original object is always what gets forwarded when there
+        is nothing to compress.
+
+        WHY THIS EXISTS (measured 2026-07-28, live wire capture): on one real
+        request, ``tool_calls`` accounted for 116,736 of 222,177 total wire
+        chars (53%) — an agentic turn dominated by a large write_file / diff /
+        shell-output ARGUMENT — while Pass 1 handle-ization only ever looked at
+        ``content``, and Pass 3 windowing (below) only ever SHEDS ``content``.
+        That mass was invisible and unsheddable to the whole rewriter: pressure
+        climbed to 96% of n_ctx even after windowing fired 4 times, because
+        there was nothing left it was ALLOWED to touch.
+
+        SAFETY (this is why it edits values in place rather than replacing the
+        whole field): the OpenAI wire format for ``function.arguments`` is a
+        JSON-encoded STRING, and llama-server's chat template parses it into a
+        mapping before rendering (`tool_call.arguments|items` requires a dict —
+        verified against the live template). Replacing ``arguments`` with an
+        arbitrary non-JSON stub string would make that parse fail — a hard
+        request error, not just a quality regression. So this only ever edits
+        STRING VALUES inside the already-decoded object and re-encodes the
+        SAME object shape back to a JSON string. Any shape that does not match
+        exactly — not a list, a non-dict entry, a missing/malformed
+        ``function``, ``arguments`` that is not a string, or that does not
+        decode to a JSON object — is left completely untouched (fail open),
+        the same posture as `normalize_volatile_stamps`.
+
+        Deterministic and idempotent by construction: `_count_for_handleization`
+        and `make_stub` are pure functions of content, `store.page_out` is
+        idempotent (same id -> same handle), and a value that is ALREADY a
+        stub is short enough to fall back under the threshold on the next
+        pass, so re-running this on already-transformed tool_calls is a no-op.
+
+        KNOWN GAP (not fixed here, low severity): stub markers embedded inside
+        an argument value are not scanned by Pass 2 auto-rehydration or the
+        Pass 4 on-wire-handle filter (`_ONWIRE_HANDLE_RE`), both of which only
+        ever look at top-level `content`. Worst case is recall re-surfacing
+        content that is already present here in stub form — a mild budget
+        inefficiency, not a correctness or prefix-stability issue.
+        """
+        if not isinstance(tool_calls, list):
+            return None
+        out: Optional[list] = None
+        for i, tc in enumerate(tool_calls):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            args = fn.get("arguments")
+            if not isinstance(args, str):
+                continue
+            try:
+                parsed = json.loads(args)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            new_parsed: Optional[dict] = None
+            for key, value in parsed.items():
+                if not isinstance(value, str):
+                    continue
+                tokens = self._count_for_handleization(value)
+                if tokens is None or tokens < self.config.handle_threshold_tokens:
+                    continue
+                # Namespaced by arg name so a large "content" value and a large
+                # "diff" value never collide even if (improbably) byte-identical.
+                role = f"toolcall-arg:{key}"
+                mid = self.stable_id(role, value)
+                handle = self.store.page_out(  # idempotent: same id -> same handle
+                    Message(role=role, content=value, id=mid)
+                )
+                stub = self.make_stub(
+                    handle, role, tokens, value, self.config.stub_preview_chars
+                )
+                if new_parsed is None:
+                    new_parsed = dict(parsed)
+                new_parsed[key] = stub
+                handle_ized_ids.append(mid)
+            if new_parsed is None:
+                continue
+            # Compact separators (matches sensing.canonical_content's convention):
+            # every byte here is wire cost we are trying to reduce.
+            new_args = json.dumps(new_parsed, ensure_ascii=False,
+                                  separators=(",", ":"))
+            if out is None:
+                out = list(tool_calls)
+            new_tc = dict(tc)
+            new_fn = dict(fn)
+            new_fn["arguments"] = new_args
+            new_tc["function"] = new_fn
+            out[i] = new_tc
+        return out
+
+    def _append_with_tool_calls(self, rewritten: list, out_msg, msg,
+                                handle_ized_ids: list) -> None:
+        """Append `out_msg` (Pass 1's role/content resolution for `msg`) to
+        `rewritten`, first transforming any large tool_calls argument strings.
+        `out_msg` keeps its ORIGINAL tool_calls untouched when nothing needed
+        stubbing (see `_handleize_tool_calls`); non-dict `out_msg`/`msg` (the
+        defensive non-dict passthrough case) are left alone entirely."""
+        tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+        if tool_calls is not None and isinstance(out_msg, dict):
+            new_tc = self._handleize_tool_calls(tool_calls, handle_ized_ids)
+            if new_tc is not None:
+                out_msg["tool_calls"] = new_tc
+        rewritten.append(out_msg)
 
     # -------------------------------------------------------------- rewrite
     def rewrite_outgoing(self, messages: list[dict], *,
@@ -461,14 +762,14 @@ class PromptRewriter:
                 h = self._primary_handle(content)
                 if h is not None:
                     recent_stubs.append((h, role))
-                rewritten.append(dict(msg))
+                self._append_with_tool_calls(rewritten, dict(msg), msg, handle_ized_ids)
                 continue
 
             if isinstance(content, str) and self.is_rehydrated(content):
                 # Already a synthetic rehydrated message from a prior turn:
                 # already-rewritten output. Pass through UNCHANGED (never
                 # handle-ize, never page out) — §9.1 idempotency fix.
-                rewritten.append(dict(msg))
+                self._append_with_tool_calls(rewritten, dict(msg), msg, handle_ized_ids)
                 continue
 
             if isinstance(content, str):
@@ -488,13 +789,19 @@ class PromptRewriter:
                         stub = self.make_stub(
                             handle, role, tokens, content, self.config.stub_preview_chars
                         )
-                    rewritten.append({"role": role, "content": stub})
+                    self._append_with_tool_calls(
+                        rewritten, {"role": role, "content": stub}, msg, handle_ized_ids
+                    )
                     handle_ized_ids.append(mid)
                     recent_stubs.append((handle, role))
                     continue
 
-            # Pass through unchanged (covers non-string content too).
-            rewritten.append(dict(msg) if isinstance(msg, dict) else msg)
+            # Pass through unchanged (covers non-string content too). This is
+            # the common path for a tool-call turn: an assistant message with
+            # content=None and tool_calls=[...] never matches any of the
+            # isinstance(content, str) branches above.
+            out_msg = dict(msg) if isinstance(msg, dict) else msg
+            self._append_with_tool_calls(rewritten, out_msg, msg, handle_ized_ids)
 
         # ---- Pass 2: auto-rehydration of explicit references ----
         rehydrated_handles: list[str] = []
@@ -575,8 +882,8 @@ class PromptRewriter:
                         break
             rewritten = out
 
-        # ---- Pass 3: total-budget windowing (LOSSLESS, two-water hysteresis) ----
-        # Bound the TOTAL wire below context_budget_ratio * n_ctx (HIGH water = the
+        # ---- Pass 3: total-budget windowing (LOSSLESS, three-water hysteresis) ----
+        # Bound the TOTAL wire below context_budget_ratio * n_ctx (MID water = the
         # trigger AND the ceiling) by paging out the OLDEST non-pinned middle
         # messages (head + recent tail kept verbatim; paged content becomes a
         # retrievable stub -> lossless). Phase 11: because the CLI resends the
@@ -584,11 +891,34 @@ class PromptRewriter:
         # advance the stub frontier EVERY turn — invalidating the upstream's KV
         # prefix each time. So the frontier is STICKY (3a): previously-windowed
         # messages are re-stubbed byte-identically from cached counts, and paging
-        # only ADVANCES (3b) when the wire crosses the high water — then it cuts
+        # only ADVANCES (3b) when the wire crosses the mid water — then it cuts
         # deep to the LOW water (context_target_ratio) in one bite. Between
         # triggers the wire prefix is byte-stable, so the KV cache is reused and
         # only the tail (+ recall block) is re-processed.
+        #
+        # THIRD TIER (2026-07-28, opt-in via context_emergency_ratio, 0 = off):
+        # the HIGH water. A trigger that cannot reach the low water LATCHES
+        # (below) rather than re-breaking the prefix for nothing — but a live
+        # session showed pressure climb to 96% of n_ctx while latched, because
+        # the hysteresis-gap re-arm didn't fire fast enough against unsheddable
+        # mass (large tool_calls arguments — see the 2026-07-28 Pass 1 fix; the
+        # HIGH water is a general safety net, not specific to that one cause).
+        # Crossing the HIGH water OVERRIDES the latch: a shed is attempted every
+        # request regardless, on the reasoning that a failed retry costs no more
+        # than the first trigger already did (see `emergency_water` below).
         windowing_triggered = False
+        # 14b: did windowing actually CHANGE BYTES this call (page at least one
+        # previously-verbatim message)? A high-water crossing that sheds
+        # nothing breaks nothing — and therefore has no break for a recall
+        # flush to ride (see Pass 4). This is the predicate the flush policy
+        # consumes; windowing_triggered stays the crossing signal for metrics.
+        windowing_shed = False
+        # True iff the HIGH-water override actually FIRED — i.e. the latch
+        # WOULD have suppressed this turn's trigger and didn't only because
+        # pressure had crossed emergency_water. Distinct from a plain trigger
+        # (which needs no override) so /metrics can show whether the third
+        # tier is doing anything, not just whether it is configured.
+        windowing_emergency = False
         high_water: Optional[int] = high_water_tokens
         if high_water is None and self._n_ctx and self.config.context_budget_ratio > 0.0:
             high_water = int(self._n_ctx * self.config.context_budget_ratio)
@@ -603,6 +933,13 @@ class PromptRewriter:
                 low_water = min(low_water, int(high_water * target / budget))
             if low_water >= high_water:
                 low_water = high_water  # collapsed/disabled gap -> legacy per-turn line
+            gap = high_water - low_water
+            # HIGH water (third tier): only meaningful when set ABOVE the mid
+            # water (config validates this at construction) — None means "no
+            # emergency tier", preserving today's behavior exactly.
+            emergency_water: Optional[int] = None
+            if self._n_ctx and self.config.context_emergency_ratio > 0.0:
+                emergency_water = int(self._n_ctx * self.config.context_emergency_ratio)
             tail_start = len(rewritten) - self.config.protect_last_n
             windowed = self._windowed.get(conv_key)
 
@@ -643,18 +980,46 @@ class PromptRewriter:
                 # real tokens too: page until the visible savings cover the
                 # overshoot (or the middle runs out — the rest is invisible mass
                 # only content-visibility work can reach).
-                if pressure_tokens > high_water and self.config.protect_first_n < tail_start:
-                    windowing_triggered = True
-                    if windowed is None:
-                        windowed = self._windowed.setdefault(conv_key, {})
-                    self._lru_touch(self._windowed, conv_key)
-                    target_shed = pressure_tokens - low_water
-                    shed = 0
-                    i = self.config.protect_first_n
-                    while shed < target_shed and i < tail_start:
-                        shed += self._window_out(rewritten, i, windowed,
-                                                 handle_ized_ids, None)
-                        i += 1
+                if pressure_tokens <= high_water:
+                    # Below the trigger the crisis is over: re-arm the latch so
+                    # the next crossing is tried fresh.
+                    self._window_latched.pop(conv_key, None)
+                elif self.config.protect_first_n < tail_start:
+                    latched_at = self._window_latched.get(conv_key)
+                    would_latch = (latched_at is not None and gap > 0
+                                  and pressure_tokens < latched_at + gap)
+                    emergency = (emergency_water is not None
+                                and pressure_tokens >= emergency_water)
+                    if would_latch and not emergency:
+                        # LATCHED: the last trigger could not reach low water
+                        # (unsheddable mass) — re-firing now would break the
+                        # prefix for nothing. Hold the wire byte-stable until
+                        # pressure grows by the hysteresis gap — UNLESS pressure
+                        # has crossed the HIGH water, in which case the latch is
+                        # overridden below regardless of the gap.
+                        pass
+                    else:
+                        if would_latch and emergency:
+                            windowing_emergency = True
+                        windowing_triggered = True
+                        if windowed is None:
+                            windowed = self._windowed.setdefault(conv_key, {})
+                        self._lru_touch(self._windowed, conv_key)
+                        target_shed = pressure_tokens - low_water
+                        shed = 0
+                        i = self.config.protect_first_n
+                        while shed < target_shed and i < tail_start:
+                            shed += self._window_out(rewritten, i, windowed,
+                                                     handle_ized_ids, None)
+                            i += 1
+                        windowing_shed = shed > 0
+                        if gap > 0:
+                            if shed < target_shed:
+                                # Missed low water: unsheddable mass — latch.
+                                self._window_latched[conv_key] = pressure_tokens
+                                self._lru_touch(self._window_latched, conv_key)
+                            else:
+                                self._window_latched.pop(conv_key, None)
             else:
                 # Legacy open-loop gate: estimate tokens as chars/4 to avoid
                 # per-message tokenizer calls on the common under-trigger case;
@@ -673,15 +1038,36 @@ class PromptRewriter:
                     ]
                     total = sum(counts)
                     if total > high_water:
-                        windowing_triggered = True
-                        if windowed is None:
-                            windowed = self._windowed.setdefault(conv_key, {})
-                        self._lru_touch(self._windowed, conv_key)
-                        i = self.config.protect_first_n
-                        while total > low_water and i < tail_start:
-                            total -= self._window_out(rewritten, i, windowed,
-                                                      handle_ized_ids, counts[i])
-                            i += 1
+                        latched_at = self._window_latched.get(conv_key)
+                        would_latch = (latched_at is not None and gap > 0
+                                      and total < latched_at + gap)
+                        emergency = (emergency_water is not None
+                                    and total >= emergency_water)
+                        if would_latch and not emergency:
+                            pass  # latched (see the real-pressure branch above)
+                        else:
+                            if would_latch and emergency:
+                                windowing_emergency = True
+                            windowing_triggered = True
+                            if windowed is None:
+                                windowed = self._windowed.setdefault(conv_key, {})
+                            self._lru_touch(self._windowed, conv_key)
+                            total_before = total
+                            i = self.config.protect_first_n
+                            while total > low_water and i < tail_start:
+                                total -= self._window_out(rewritten, i, windowed,
+                                                          handle_ized_ids, counts[i])
+                                i += 1
+                            windowing_shed = total < total_before
+                            if gap > 0:
+                                if total > low_water:
+                                    self._window_latched[conv_key] = total_before
+                                    self._lru_touch(self._window_latched, conv_key)
+                                else:
+                                    self._window_latched.pop(conv_key, None)
+                    else:
+                        # Measured under the high water after all: re-arm.
+                        self._window_latched.pop(conv_key, None)
 
         # ---- Pass 4: auto-recall (anticipatory demand paging, Phase 10) ----
         # The live run proved agents do not ask for their memory back
@@ -700,8 +1086,9 @@ class PromptRewriter:
         # is FROZEN once built and re-injected byte-identically before the same
         # anchor message each turn; it is recomputed — in one jump, at the new
         # tail — only on a refresh trigger: enough growth since the freeze, the
-        # anchor gone (host CLI compacted), or a Pass-3 windowing trigger (that
-        # turn re-prefills anyway, so the refresh rides for free). Sticky turns
+        # anchor gone (host CLI compacted), or a Pass-3 windowing pass that
+        # actually paged a message (that turn re-prefills anyway, so the
+        # refresh rides for free). Sticky turns
         # skip store.search() (no hotness warming) — the refresh cadence warms
         # instead.
         recalled_handles: list[str] = []
@@ -710,15 +1097,19 @@ class PromptRewriter:
             stale_bound = self.config.recall_max_stale_tokens
             # FLUSH EPOCH (Phase 14b): the prefix is already broken this turn —
             # by the harness (classifier verdict passed in as prefix_broken) or
-            # by a Pass-3 trigger — so the pending refresh rides the break for
-            # free. Otherwise the block stays frozen until the HARD staleness
-            # bound (growth past recall_max_stale_tokens, or anchor loss).
-            flush = prefix_broken or windowing_triggered
+            # by Pass 3 ACTUALLY PAGING a message (windowing_shed — that turn
+            # re-prefills anyway, so the refresh rides the break for free).
+            # A bare high-water crossing that shed nothing breaks nothing, so a
+            # flush then would CREATE the very break it exists to ride — the
+            # self-fulfilling re-prefill loop of 2026-07-19. Otherwise the
+            # block stays frozen until the HARD staleness bound (growth past
+            # recall_max_stale_tokens, or anchor loss).
+            flush = prefix_broken or windowing_shed
             frozen = self._recall_frozen.get(conv_key)
             reused = False
             if stale_bound > 0 and not flush and frozen is not None:
-                anchor_mid, block = frozen
-                idx = self._find_recall_anchor(rewritten, anchor_mid)
+                anchor_mid, anchor_index, block = frozen
+                idx = self._find_recall_anchor(rewritten, anchor_mid, anchor_index)
                 if idx is not None:
                     # canonical_content: structured (content-parts) growth counts
                     # too — previously invisible, so image tails never aged the
@@ -754,9 +1145,15 @@ class PromptRewriter:
                         # stable_id_any: non-str anchors (content-parts) freeze
                         # too — the Phase-12 skip made every image turn a
                         # guaranteed prefix break.
+                        # insert_at is the anchor's index in a BLOCK-FREE wire
+                        # (the block now sits at insert_at, the anchor shifted
+                        # to insert_at + 1) — stored so the anchor's OCCURRENCE
+                        # can be pinned next turn even when its content is
+                        # duplicated earlier on the wire.
                         self._recall_frozen[conv_key] = (
                             self.stable_id_any(anchor.get("role", ""),
                                                anchor.get("content")),
+                            insert_at,
                             block,
                         )
                         self._lru_touch(self._recall_frozen, conv_key)
@@ -767,6 +1164,7 @@ class PromptRewriter:
             rehydrated_handles=rehydrated_handles,
             recalled_handles=recalled_handles,
             windowing_triggered=windowing_triggered,
+            windowing_emergency=windowing_emergency,
         )
 
     # ----------------------------------------------------------- windowing
@@ -805,25 +1203,40 @@ class PromptRewriter:
         return orig_tokens - stub_tokens
 
     # ---------------------------------------------------------- auto-recall
-    def _find_recall_anchor(self, messages: list[dict], anchor_mid: str) -> Optional[int]:
+    def _anchor_matches(self, msg, anchor_mid: str, anchor_handle: str) -> bool:
+        """True iff `msg` IS the frozen anchor: by identity (`stable_id` equals
+        `anchor_mid` — byte-identical content, the common case; non-str
+        content-parts match via `stable_id_any`, 14b), or — if Pass 1/3 stubbed
+        it since the freeze — by its stub's primary handle."""
+        if not isinstance(msg, dict):
+            return False
+        content = msg.get("content")
+        if self.stable_id_any(msg.get("role", ""), content) == anchor_mid:
+            return True
+        return (isinstance(content, str)
+                and (self.is_stub(content) or self.is_diff_stub(content))
+                and self._primary_handle(content) == anchor_handle)
+
+    def _find_recall_anchor(self, messages: list[dict], anchor_mid: str,
+                            anchor_index: Optional[int] = None) -> Optional[int]:
         """Index of the message the frozen recall block precedes, or None if it
-        left the transcript (host-CLI compaction/edit -> refresh). A message
-        matches by identity, not position: its `stable_id` equals `anchor_mid`
-        (byte-identical content, the common case), or — if Pass 1/3 stubbed it
-        since the freeze — its stub's primary handle equals `anchor_mid`'s
-        handle. FIRST match wins: first-from-start is stable under append, so a
-        later duplicate of the anchor's content can never move the block."""
+        left the transcript (host-CLI compaction/edit -> refresh).
+
+        The occurrence AT `anchor_index` (its position in the block-free wire
+        at freeze time) wins first: under pure append an anchor's index never
+        moves, so an exact-index match keeps the block at its last-sent
+        position even when the anchor's CONTENT is duplicated earlier on the
+        wire — a repeated boilerplate message used to relocate the block
+        BACKWARD to the first match, a voluntary prefix break per flush epoch.
+        When the frozen index no longer matches (mid-wire insertions/edits
+        shifted it — a turn whose prefix the harness already broke), fall back
+        to the first match, which is stable under append."""
         anchor_handle = self.store.notes.handle_for(anchor_mid)
+        if anchor_index is not None and 0 <= anchor_index < len(messages):
+            if self._anchor_matches(messages[anchor_index], anchor_mid, anchor_handle):
+                return anchor_index
         for i, msg in enumerate(messages):
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            # stable_id_any: non-str (content-parts) anchors match too (14b).
-            if self.stable_id_any(msg.get("role", ""), content) == anchor_mid:
-                return i
-            if (isinstance(content, str)
-                    and (self.is_stub(content) or self.is_diff_stub(content))
-                    and self._primary_handle(content) == anchor_handle):
+            if self._anchor_matches(msg, anchor_mid, anchor_handle):
                 return i
         return None
 

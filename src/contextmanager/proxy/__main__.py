@@ -61,6 +61,7 @@ def load_config_from_env() -> ProxyConfig:
         handle_threshold_ratio=_env_float("CM_HANDLE_THRESHOLD_RATIO", 0.02),
         context_budget_ratio=_env_float("CM_CONTEXT_BUDGET_RATIO", 0.50),
         context_target_ratio=_env_float("CM_CONTEXT_TARGET_RATIO", 0.35),
+        context_emergency_ratio=_env_float("CM_CONTEXT_EMERGENCY_RATIO", 0.0),
         stub_preview_chars=_env_int("CM_STUB_PREVIEW_CHARS", 200),
         rehydrate_budget_tokens=_env_int("CM_REHYDRATE_BUDGET_TOKENS", 4000),
         auto_recall_k=_env_int("CM_AUTO_RECALL_K", 3),
@@ -80,6 +81,10 @@ def load_config_from_env() -> ProxyConfig:
         loop_draft_n_min=_env_int("CM_LOOP_DRAFT_N_MIN", 200),
         loop_cooldown_turns=_env_int("CM_LOOP_COOLDOWN_TURNS", 3),
         loop_hard_stop=_env_bool("CM_LOOP_HARD_STOP", False),
+        diag_enabled=_env_bool("CM_DIAG_ENABLED", True),
+        diag_tokenize=_env_bool("CM_DIAG_TOKENIZE", False),
+        diag_max_samples=_env_int("CM_DIAG_MAX_SAMPLES", 64),
+        wire_capture_dir=os.environ.get("CM_WIRE_CAPTURE_DIR") or None,
     )
 
 

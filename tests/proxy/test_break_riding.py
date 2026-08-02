@@ -113,6 +113,30 @@ class TestSteadyState:
         assert r3.recalled_handles == []
         assert r3.messages[: len(r2.messages)] == r2.messages
 
+    def test_duplicated_anchor_stays_put(self, tmp_path):
+        """The freeze anchors by content, and the anchor message's content also
+        appears EARLIER on the wire (a repeated boilerplate turn). The
+        exact-index pin keeps the block at its last-sent position — first-match
+        used to relocate it BACKWARD, a voluntary prefix break per flush."""
+        cfg, store, counter, rw = _rewriter(tmp_path)
+        h = _seed(store, "old-1", "unicorn banana smoothie recipe with quantum sprinkles")
+        dup = "unicorn smoothie quantum repeat me"
+        t1 = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": dup},
+            {"role": "assistant", "content": "mid turn answer"},
+            {"role": "user", "content": dup},   # the anchor: content duplicated at index 1
+        ]
+        r1 = rw.rewrite_outgoing(t1)
+        assert r1.recalled_handles == [h]
+        t2 = t1 + [
+            {"role": "assistant", "content": "next answer"},
+            {"role": "user", "content": "fresh question"},
+        ]
+        r2 = rw.rewrite_outgoing(t2)
+        assert r2.recalled_handles == []                       # frozen block reused
+        assert r2.messages[: len(r1.messages)] == r1.messages  # ...at the SAME position
+
 
 # ---------------------------------------------------------------------------
 # 14b — per-conversation sticky state
@@ -317,3 +341,95 @@ class TestRealPressure:
         r2 = rw.rewrite_outgoing(msgs2, pressure_tokens=90)
         assert r2.windowing_triggered is False
         assert r2.messages[: len(r1.messages)] == r1.messages
+
+
+# ---------------------------------------------------------------------------
+# 14b hardening — futile crossings: no flush, latch, re-arm (2026-07-19 incident)
+# ---------------------------------------------------------------------------
+
+
+class TestFutileCrossing:
+    """n_ctx=200, HIGH=100, LOW=60, hysteresis gap=40 (FakeCounter: token = word)."""
+
+    def _setup(self, tmp_path, **over):
+        cfg, store, counter, rw = _rewriter(
+            tmp_path, n_ctx=200,
+            context_budget_ratio=0.5, context_target_ratio=0.3,
+            recall_max_stale_tokens=10_000,
+            **over,
+        )
+        h = _seed(store, "old-1",
+                  "unicorn banana smoothie recipe with quantum sprinkles")
+        t1 = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "unicorn banana smoothie recipe quantum?"},
+        ]
+        r1 = rw.rewrite_outgoing(t1)
+        assert r1.recalled_handles == [h]
+        # Middle messages too SMALL to page: a 2-word message's minimal stub
+        # costs more words than it saves, so Pass 3 sheds nothing.
+        tiny = [{"role": "user", "content": "tick tack"} for _ in range(4)]
+        tail = [{"role": "user", "content": f"tail step {w}"}
+                for w in ("one", "two", "three", "four", "five", "six")]
+        t2 = t1 + tiny + tail
+        return rw, t1, r1, t2
+
+    def test_futile_trigger_neither_flushes_nor_breaks(self, tmp_path):
+        """The 2026-07-19 self-own: a high-water crossing that sheds NOTHING
+        broke nothing — flushing the frozen recall block then CREATES the
+        prefix break it exists to ride."""
+        rw, t1, r1, t2 = self._setup(tmp_path)
+        r2 = rw.rewrite_outgoing(t2, pressure_tokens=150)
+        assert r2.windowing_triggered is True       # the crossing is real...
+        assert r2.recalled_handles == []            # ...but the block was reused
+        assert r2.messages[: len(r1.messages)] == r1.messages  # byte-stable prefix
+
+    def test_shedding_trigger_still_flushes(self, tmp_path):
+        """The flush keeps riding REAL breaks: a trigger that actually pages
+        messages (shed > 0) refreshes the block, as the legacy path pins in
+        test_recall.test_windowing_trigger_refreshes."""
+        rw, t1, r1, t2 = self._setup(tmp_path, handle_threshold_tokens=50)
+        fillers = [
+            {"role": "user",
+             "content": " ".join(f"fillstuff{i}word{j}" for j in range(15))}
+            for i in range(8)
+        ]
+        tail = [{"role": "user", "content": f"unicorn smoothie quantum step {w}"}
+                for w in ("alpha", "beta", "gamma", "delta", "epsilon", "zeta")]
+        r2 = rw.rewrite_outgoing(t1 + fillers + tail, pressure_tokens=150)
+        assert r2.windowing_triggered is True
+        assert r2.recalled_handles == ["old-1"]    # shed > 0 -> flush rode the break
+
+    def test_missed_low_water_latches_until_gap_growth(self, tmp_path):
+        """Unsheddable mass above the high water: after one honest attempt the
+        latch holds the wire byte-stable instead of re-breaking every turn,
+        re-arming only when pressure grows by the hysteresis gap (40)."""
+        rw, t1, r1, t2 = self._setup(tmp_path)
+        r2 = rw.rewrite_outgoing(t2, pressure_tokens=150)   # sheds 0 -> latched @150
+        assert r2.windowing_triggered is True
+        t3 = t2 + [{"role": "assistant", "content": "ack"},
+                   {"role": "user", "content": "tail step seven"}]
+        r3 = rw.rewrite_outgoing(t3, pressure_tokens=170)   # < 150 + 40: suppressed
+        assert r3.windowing_triggered is False
+        assert r3.recalled_handles == []
+        assert r3.messages[: len(r2.messages)] == r2.messages
+        t4 = t3 + [{"role": "assistant", "content": "ack"},
+                   {"role": "user", "content": "tail step eight"}]
+        r4 = rw.rewrite_outgoing(t4, pressure_tokens=195)   # >= 150 + 40: re-armed
+        assert r4.windowing_triggered is True
+        assert r4.recalled_handles == []                    # still futile -> no flush
+        assert r4.messages[: len(r3.messages)] == r3.messages
+
+    def test_latch_clears_when_pressure_falls_below_high_water(self, tmp_path):
+        rw, t1, r1, t2 = self._setup(tmp_path)
+        r2 = rw.rewrite_outgoing(t2, pressure_tokens=150)   # latched @150
+        assert r2.windowing_triggered is True
+        t3 = t2 + [{"role": "assistant", "content": "ack"},
+                   {"role": "user", "content": "tail step seven"}]
+        r3 = rw.rewrite_outgoing(t3, pressure_tokens=90)    # <= HIGH: latch cleared
+        assert r3.windowing_triggered is False
+        t4 = t3 + [{"role": "assistant", "content": "ack"},
+                   {"role": "user", "content": "tail step eight"}]
+        # 170 < 150 + 40 would have been suppressed had the latch survived.
+        r4 = rw.rewrite_outgoing(t4, pressure_tokens=170)
+        assert r4.windowing_triggered is True

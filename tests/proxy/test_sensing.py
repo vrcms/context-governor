@@ -358,7 +358,12 @@ class TestPressure:
         grown = "x" * 400  # 100 estimated tokens of growth
         t2 = t1 + [{"role": "assistant", "content": grown}]
         obs2 = ctrl.observe_request(t2)
-        assert obs2.pressure_tokens == 1000 + 52 + 100
+        # CHANGED 2026-07-28: was `1000 + 52 + 100`, which pinned a double-count.
+        # That appended assistant message IS the previous completion arriving as
+        # history, so it is already inside the growth term (400 chars ~ 100
+        # tokens); adding last_completion_tokens (52) on top counted the same
+        # content twice. See sensing._growth_estimate.
+        assert obs2.pressure_tokens == 1000 + 100
 
 
 class TestCeilingLearning:
@@ -396,9 +401,91 @@ class TestCeilingLearning:
                      {"role": "assistant", "content": "ok"}]
         obs2 = ctrl.observe_request(compacted)
         assert obs2.key != obs1.key
+        # The wire shape is recognized (reclassified head-rewrite), but the
+        # sample is only BANKED — a side-call sharing the system head has the
+        # same shape, so learning waits for temporal confirmation.
         assert obs2.kind == KIND_HEAD_REWRITE and obs2.cause == CAUSE_HARNESS
-        assert ctrl.snapshot()["native_compaction_observed"] == 1
-        assert ctrl.snapshot()["learned_ceilings"][obs1.harness_fp]["ceiling"] == 20000
+        snap = ctrl.snapshot()
+        assert snap["native_compaction_observed"] == 0
+        assert snap["learned_ceilings"] == {}
+        assert snap["pending_ceiling_samples"] == 1
+        # CONFIRMED: the suspected-compacted conversation continues with a
+        # pure append — a one-turn side-call never does this.
+        continued = compacted + [{"role": "user", "content": "next question"}]
+        obs3 = ctrl.observe_request(continued)
+        assert obs3.kind == KIND_APPEND
+        snap = ctrl.snapshot()
+        assert snap["native_compaction_observed"] == 1
+        assert snap["learned_ceilings"][obs1.harness_fp]["ceiling"] == 20000
+        assert snap["pending_ceiling_samples"] == 0
+
+    def test_cross_key_retracted_when_old_key_stays_alive(self):
+        # The 2026-07-19 false ceiling: a side-call sharing the system head
+        # has the cross-key head-rewrite shape, but its PARENT conversation
+        # keeps turning — a true compaction kills the old key.
+        ctrl = GovernorController()
+        t1, obs1 = self._grow_and_observe(ctrl)
+        side_call = [t1[0],
+                     {"role": "user", "content": "generate a short title"},
+                     {"role": "assistant", "content": "a title"},
+                     {"role": "user", "content": "shorter please"}]
+        obs2 = ctrl.observe_request(side_call)
+        assert obs2.kind == KIND_HEAD_REWRITE  # banked, not learned
+        assert ctrl.snapshot()["pending_ceiling_samples"] == 1
+        # The parent conversation reappears with a pure append -> retract.
+        parent_continues = t1 + [{"role": "user", "content": "back to work"}]
+        obs3 = ctrl.observe_request(parent_continues)
+        assert obs3.kind == KIND_APPEND
+        assert ctrl.snapshot()["pending_ceiling_samples"] == 0
+        # Even if the side-call continues now, nothing is left to confirm.
+        ctrl.observe_request(side_call + [{"role": "assistant", "content": "t"}])
+        snap = ctrl.snapshot()
+        assert snap["native_compaction_observed"] == 0
+        assert snap["learned_ceilings"] == {}
+
+    def test_early_edit_without_shrink_learns_nothing(self):
+        # Same-key divergence in the first quarter that does NOT shrink the
+        # wire (a harness refreshing a session-state block) classifies as a
+        # head-rewrite but must not lower the ceiling.
+        ctrl = GovernorController()
+        t1, obs1 = self._grow_and_observe(ctrl)
+        edited = [dict(m) for m in t1]
+        edited[2] = {"role": "user", "content": "session state refreshed"}
+        obs2 = ctrl.observe_request(edited)
+        assert obs2.kind == KIND_HEAD_REWRITE and obs2.cause == CAUSE_HARNESS
+        snap = ctrl.snapshot()
+        assert snap["native_compaction_observed"] == 0
+        assert snap["learned_ceilings"] == {}
+
+    def test_contradiction_raises_ceiling(self):
+        # An established conversation sailing PAST the learned ceiling
+        # uncompacted falsifies it — raise it (a later true compaction
+        # re-lowers via min-sample: self-healing in both directions).
+        ctrl = GovernorController()
+        t1, obs1 = self._grow_and_observe(ctrl)
+        compacted = t1[:2] + [{"role": "user", "content": "summary"},
+                              {"role": "user", "content": "tail"}]
+        ctrl.observe_request(compacted)  # same-key, shrank 12->4: learned
+        fp = obs1.harness_fp
+        assert ctrl.effective_high_water(100_000, 0.5, 0.8, fp) == 16000
+        # The compacted conversation grows and its real prompt sails past
+        # 20000 with no compaction in sight (turns >= 2 at response time).
+        t2 = compacted + [{"role": "user", "content": "more work"}]
+        obs2 = ctrl.observe_request(t2)
+        ctrl.observe_response(obs2.key, {"usage": {"prompt_tokens": 25000}})
+        snap = ctrl.snapshot()
+        assert snap["learned_ceilings"][fp]["ceiling"] == 25000
+        assert snap["learned_ceilings"][fp]["raised"] == 1
+        assert ctrl.effective_high_water(100_000, 0.5, 0.8, fp) == 20000
+        # A later TRUE compaction re-pins the ceiling via min-sample (grow the
+        # wire first so the divergence lands inside the first quarter again).
+        grown = t2 + [{"role": "assistant", "content": f"step {i}"} for i in range(4)]
+        obs3 = ctrl.observe_request(grown)
+        ctrl.observe_response(obs3.key, {"usage": {"prompt_tokens": 24000}})
+        t3 = grown[:2] + [{"role": "user", "content": "summary two"},
+                          {"role": "user", "content": "tail"}]
+        ctrl.observe_request(t3)
+        assert ctrl.snapshot()["learned_ceilings"][fp]["ceiling"] == 24000
 
     def test_fresh_two_message_chat_is_not_compaction(self):
         ctrl = GovernorController()

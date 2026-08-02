@@ -35,8 +35,13 @@ class ProxyStats:
     messages_rehydrated: int = 0
     slices_recalled: int = 0  # Pass-4 auto-recall (the read-path counterpart)
     windowing_triggers: int = 0  # Pass-3 high-water crossings; << requests = KV reuse
+    windowing_emergencies: int = 0  # subset forced by the HIGH-water latch override
+                                    # (context_emergency_ratio, 2026-07-28); should be
+                                    # rarer still — a steady rate means something is
+                                    # chronically unsheddable, not just under-triggered
     loop_injections: int = 0  # Phase-13 breaker notices appended (should be RARE)
     loop_hard_stops: int = 0  # Phase-13 synthetic final responses (hard-stop mode)
+    assistant_tail_merges: int = 0  # boundary repairs of >=2 trailing assistants (llama-server 400s those)
     chars_in: int = 0
     chars_out: int = 0
     peak_chars_out: int = 0  # single-request high-water of the rewritten wire size
@@ -65,7 +70,9 @@ class StatsCollector:
         chars_out: int,
         slices_recalled: int = 0,
         windowing_triggered: bool = False,
+        windowing_emergency: bool = False,
         loop_injected: bool = False,
+        assistant_tail_merged: bool = False,
     ) -> None:
         with self._lock:
             s = self._stats
@@ -76,8 +83,12 @@ class StatsCollector:
             s.slices_recalled += slices_recalled
             if windowing_triggered:
                 s.windowing_triggers += 1
+            if windowing_emergency:
+                s.windowing_emergencies += 1
             if loop_injected:
                 s.loop_injections += 1
+            if assistant_tail_merged:
+                s.assistant_tail_merges += 1
             s.chars_in += chars_in
             s.chars_out += chars_out
             if chars_out > s.peak_chars_out:
@@ -104,8 +115,10 @@ class StatsCollector:
                 "messages_rehydrated": s.messages_rehydrated,
                 "slices_recalled": s.slices_recalled,
                 "windowing_triggers": s.windowing_triggers,
+                "windowing_emergencies": s.windowing_emergencies,
                 "loop_injections": s.loop_injections,
                 "loop_hard_stops": s.loop_hard_stops,
+                "assistant_tail_merges": s.assistant_tail_merges,
                 "chars_in": chars_in,
                 "chars_out": chars_out,
                 "chars_saved": chars_saved,
