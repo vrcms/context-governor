@@ -177,9 +177,6 @@ real `n_ctx` from `/props` and:
 - **(c) propagates** the true `n_ctx` into `/v1/models`, so CLIs read the real window instead
   of guessing.
 
-Deeper concept notes (the surfaces, the store, the no-re-fire invariant, the
-compaction mechanics): [wiki/index.md](wiki/index.md).
-
 ## License
 
 [MIT](LICENSE).
