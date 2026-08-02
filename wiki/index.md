@@ -1,6 +1,6 @@
 ---
 title: Index
-updated: 2026-06-23
+updated: 2026-08-02
 ---
 
 # ContextManager - Knowledge Base
@@ -20,5 +20,4 @@ Entry point. Browse the graph from here.
 
 **Operational docs**
 - [[configuration]] — every parameter, where to set it, and which way is safe to turn it.
-- Plan + milestones: [tasks/plan.md](../tasks/plan.md).
 - Wiring to a CLI: [integration/README.md](../integration/README.md).

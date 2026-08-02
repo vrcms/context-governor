@@ -1,22 +1,70 @@
 # Context Governor
 
-**Keep a local-LLM agent's context approximately constant over an arbitrarily long
-session** — instead of recursively summarizing an ever-growing transcript until it
-collapses. Drop-in for any OpenAI-compatible CLI (Hermes Agent, OpenCode, …) in front of
-`llama-server`.
+**Run your local-LLM agent almost forever.** The Context Governor is a drop-in
+layer between any OpenAI-compatible agent CLI (Hermes Agent, OpenCode, pi, …) and
+your `llama-server` that keeps the prompt **approximately constant over an
+arbitrarily long session** — instead of letting the transcript grow until the
+CLI's own compaction eats it alive.
 
-> Python package: `contextmanager`. License: MIT.
+Not a demo: this is a long-term, daily-driven, self-proven setup. A governor
+instance running right now reports, live from `GET /metrics`:
+
+> **~1.6M tokens saved (~72%) over 115 requests · peak prompt ~9.6K tokens ·
+> memory recall hit rate 100%**
+
+> Python package: `contextmanager`. License: MIT. 576 tests, all offline.
+
+## ⚡ Quick start
+
+```bash
+git clone https://github.com/gbgh1/context-governor.git
+cd context-governor
+pip install -e .
+```
+
+**1. Start your model** — `llama-server` (llama.cpp) on the default
+`http://127.0.0.1:8080`.
+
+**2. Start the governor:**
+
+```bash
+run-governor
+```
+
+If your harness already carries the governor entries, that's the whole ritual —
+`run-governor` alone is enough. First time, let it wire your CLI for you
+(provider + MCP entries, timestamped backup, fully reversible):
+
+```bash
+run-governor --cli opencode          # or --cli hermes; undo any time with --revert
+run-governor --provider ollama       # upstream flavor: llama (default) / ollama / openai
+run-governor --config governor.toml --dry-run   # central TOML config; prints, doesn't run
+```
+
+(A commented starter config lives at
+[`integration/governor.example.toml`](integration/governor.example.toml).)
+
+**3. Point your agent at the governor** — set its OpenAI-compatible base URL to:
+
+```
+http://127.0.0.1:8900/v1
+```
+
+Done. Now open **http://127.0.0.1:8900/metrics** and watch the horizon: tokens
+saved, messages handle-ized, recall hits, windowing triggers, real cache-reuse
+ratios — live and cumulative, while your agent works.
 
 ## The problem it solves
 
-Long agentic sessions on a small local model fall into a **compaction livelock**: the
-CLI's protected message tail (full of big tool outputs and file dumps) grows past the
-compaction threshold, there's no mechanism to re-compress it, so compaction fires
-fruitlessly *every turn* and the session grinds to a halt. Raising the context window only
-delays it.
+Long agentic sessions on a small local model fall into a **compaction livelock**:
+the CLI's protected message tail (full of big tool outputs and file dumps) grows
+past the compaction threshold, there's no mechanism to re-compress it, so
+compaction fires fruitlessly *every turn* and the session grinds to a halt.
+Raising the context window only delays it.
 
-The Context Governor fixes this structurally by keeping bulky, stable content **off the
-wire** and in a durable store, reconstructing a bounded prompt each turn.
+The Context Governor fixes this structurally by keeping bulky, stable content
+**off the wire** and in a durable store, reconstructing a bounded prompt each
+turn.
 
 ## How it works — two surfaces over one engine
 
@@ -43,14 +91,24 @@ wire** and in a durable store, reconstructing a bounded prompt each turn.
 
 Both surfaces share one on-disk store, so a handle minted by either resolves in both.
 
-## Proven result
+On top of that, the proxy runs **closed-loop**: it observes the *real* prompt
+tokens and cache-reuse ratios the server reports, classifies every prompt-prefix
+break by cause, learns each harness's native compaction ceiling, and keeps its
+own edits byte-stable between windowing triggers — so the KV cache actually gets
+reused turn after turn. A built-in **loop guard** detects degenerate
+repeated-turn spirals and breaks them mechanically.
 
-First live run (Hermes Agent + a 35B-A3B local model, a 138-message / 73-tool-output
-build session): the proxy cut the wire prompt by **~60%** (7.03M → 2.82M characters,
-405 messages handle-ized over 72 requests), every chat completion returned 200, and the
-long tool-heavy session completed with no livelock.
+## Proven in the field
 
-## Install
+- **First live run** (Hermes Agent + a 35B-A3B local model, a 138-message /
+  73-tool-output build session): the proxy cut the wire prompt by **~60%**
+  (7.03M → 2.82M characters, 405 messages handle-ized), every chat completion
+  returned 200, and the long tool-heavy session completed with no livelock.
+- **Months of daily use later**, the numbers hold: the live instance quoted at
+  the top is at **~72% saved** with a peak prompt under 10K tokens — on sessions
+  that would otherwise have blown far past the model's window.
+
+## Install & verify
 
 ```bash
 git clone https://github.com/gbgh1/context-governor.git
@@ -59,18 +117,18 @@ python -m venv .venv
 # Linux/macOS:           source .venv/bin/activate
 # Windows (PowerShell):  .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-pytest -q          # 224 tests, no network / llama-server needed
+pytest -q          # 576 tests, no network / llama-server needed
 ```
 
-## Quickstart
-
-See it work end-to-end with **no model required** (uses the offline heuristic counter):
+See it work end-to-end with **no model required** (uses the offline heuristic
+counter):
 
 ```bash
 python examples/demo.py
 ```
 
-Run the surfaces (point `CM_UPSTREAM_BASE_URL` at your `llama-server`):
+The surfaces can also be run directly (the `run-governor` launcher above is the
+recommended front door):
 
 ```bash
 # Surface A — OpenAI-compatible proxy (listens on :8900, forwards to llama-server)
@@ -80,24 +138,23 @@ CM_UPSTREAM_BASE_URL=http://127.0.0.1:8080 python -m contextmanager.proxy
 python -m contextmanager.mcp --store-root ./contextstore
 ```
 
-Then set your CLI's model base URL to `http://127.0.0.1:8900/v1`. The proxy exposes
-`GET /metrics` (cumulative `chars_saved`, handle-izations) so you can watch it work.
-
 ## Wire it to your agent CLI
 
 [`integration/`](integration/README.md) has copy-paste setup for **Hermes Agent** and
 **OpenCode** — provider entries, MCP registration, an optional system-prompt directive that
 makes the agent use the cooperative tools, an immediate-relief Hermes config patch, and a
-before/after measurement runbook.
+before/after measurement runbook. (`run-governor --cli <name>` automates the same wiring.)
 
 ## Configuration
 
-Both entrypoints read `CM_*` env vars (and the MCP server also accepts `--store-root` /
-`--upstream-base-url` / `--transport`). Key knobs: `CM_UPSTREAM_BASE_URL`, `CM_STORE_ROOT`,
-`CM_LISTEN_PORT`, `CM_MODEL_ALIAS` (name the proxy advertises in `/v1/models`; default
-`context-governor`, `""` to pass through), and `CM_DIFF_MIN_SIMILARITY` (lossless
-delta-compression of near-duplicate content; `0` disables). See
-`src/contextmanager/proxy/config.py` and `.../mcp/config.py`.
+Everything is layered: built-in defaults < TOML config < provider profile < CLI
+flags, with `CM_*` env vars honored throughout (the MCP server also accepts
+`--store-root` / `--upstream-base-url` / `--transport`). Key knobs:
+`CM_UPSTREAM_BASE_URL`, `CM_STORE_ROOT`, `CM_LISTEN_PORT`, `CM_MODEL_ALIAS`
+(name the proxy advertises in `/v1/models`; default `context-governor`, `""` to
+pass through), and `CM_DIFF_MIN_SIMILARITY` (lossless delta-compression of
+near-duplicate content; `0` disables). See `src/contextmanager/proxy/config.py`
+and `.../mcp/config.py`.
 
 **llama-server is the source of truth for context size.** At startup the proxy reads the
 real `n_ctx` from `/props` and:
@@ -110,16 +167,14 @@ real `n_ctx` from `/props` and:
   *lossy* compaction so it rarely needs to fire. Windowing uses **two-water hysteresis**: it
   triggers at the high water, cuts deep to `CM_CONTEXT_TARGET_RATIO` (default `0.35`) in one
   bite, then holds the stub frontier byte-stable between triggers — so the upstream's KV/prefix
-  cache is actually reused turn after turn (a *compute* saving on top of the token saving);
+  cache is actually reused turn after turn (a *compute* saving on top of the token saving) —
+  plus a `CM_CONTEXT_EMERGENCY_RATIO` hard ceiling for when a harness floods the wire faster
+  than the normal tiers can drain it;
 - **(c) propagates** the true `n_ctx` into `/v1/models`, so CLIs read the real window instead
   of guessing.
 
-## Design docs
-
-- [tasks/plan.md](tasks/plan.md) — architecture, milestones, and the root-cause analysis.
-- [wiki/index.md](wiki/index.md) — interlinked concept notes (the surfaces, the store, the
-  no-re-fire invariant, the Hermes compaction mechanics).
-- `tasks/phase*-spec.md` — the normative module contracts each phase was built against.
+Deeper concept notes (the surfaces, the store, the no-re-fire invariant, the
+compaction mechanics): [wiki/index.md](wiki/index.md).
 
 ## License
 

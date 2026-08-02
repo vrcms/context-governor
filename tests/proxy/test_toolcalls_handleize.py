@@ -1,7 +1,7 @@
 """Pass 1 extension: handle-ization of large tool_calls arguments.
 
 Guards the 2026-07-28 fix for the second half of the "own-mutation windowing"
-incident (see problem-2.md). A live wire capture showed `tool_calls`
+incident. A live wire capture showed `tool_calls`
 accounting for 116,736 of 222,177 total wire chars (53%) on one request — an
 agentic turn dominated by a large write_file/edit_file/shell argument — while
 Pass 1 handle-ization and Pass 3 windowing both only ever looked at `content`.
