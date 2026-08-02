@@ -16,10 +16,11 @@ instance running right now reports, live from `GET /metrics`:
 
 ## ⚡ Quick start
 
-```bash
+```powershell
 git clone https://github.com/gbgh1/context-governor.git
 cd context-governor
-pip install -e .
+python -m venv .venv
+.venv\Scripts\python -m pip install -e .    # Linux/macOS: .venv/bin/python -m pip install -e .
 ```
 
 **1. Start your model** — `llama-server` (llama.cpp) on the default
@@ -27,21 +28,23 @@ pip install -e .
 
 **2. Start the governor:**
 
-```bash
-run-governor
+```powershell
+.\integration\run-governor.ps1
 ```
 
 If your harness already carries the governor entries, that's the whole ritual —
-`run-governor` alone is enough. First time, let it wire your CLI for you
+the bare call is enough. First time, let it wire your CLI for you
 (provider + MCP entries, timestamped backup, fully reversible):
 
-```bash
-run-governor --cli opencode          # or --cli hermes; undo any time with --revert
-run-governor --provider ollama       # upstream flavor: llama (default) / ollama / openai
-run-governor --config governor.toml --dry-run   # central TOML config; prints, doesn't run
+```powershell
+.\integration\run-governor.ps1 --cli opencode      # or --cli hermes; undo any time with --revert
+.\integration\run-governor.ps1 --provider ollama   # upstream flavor: llama (default) / ollama / openai
+.\integration\run-governor.ps1 --config governor.toml --dry-run   # central TOML config; prints, doesn't run
 ```
 
-(A commented starter config lives at
+(The wrapper runs on the repo venv and forwards every flag to the Python
+launcher — on Linux/macOS, activate the venv and use the identical
+`run-governor` console script. A commented starter config lives at
 [`integration/governor.example.toml`](integration/governor.example.toml).)
 
 **3. Point your agent at the governor** — set its OpenAI-compatible base URL to:
@@ -127,7 +130,7 @@ counter):
 python examples/demo.py
 ```
 
-The surfaces can also be run directly (the `run-governor` launcher above is the
+The surfaces can also be run directly (the launcher wrapper above is the
 recommended front door):
 
 ```bash
@@ -143,7 +146,8 @@ python -m contextmanager.mcp --store-root ./contextstore
 [`integration/`](integration/README.md) has copy-paste setup for **Hermes Agent** and
 **OpenCode** — provider entries, MCP registration, an optional system-prompt directive that
 makes the agent use the cooperative tools, an immediate-relief Hermes config patch, and a
-before/after measurement runbook. (`run-governor --cli <name>` automates the same wiring.)
+before/after measurement runbook. (`.\integration\run-governor.ps1 --cli <name>` automates
+the same wiring.)
 
 ## Configuration
 
