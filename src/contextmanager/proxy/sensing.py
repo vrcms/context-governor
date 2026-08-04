@@ -378,6 +378,12 @@ class GovernorController:
         self._last_reuse_ratio: Optional[float] = None
         self._responses_observed = 0
         self._responses_with_timings = 0
+        # Own-mutation forensics (2026-08-02): "kind@pos" -> count, plus a
+        # bounded ring of the most recent sites. Answers WHICH of our own
+        # rewrites broke the prefix and WHERE, so a fix can be aimed instead of
+        # guessed from server-side prefill timings.
+        self._own_sites: Counter = Counter()
+        self._own_recent: deque = deque(maxlen=32)
 
     # ---------------------------------------------------------- request side
     def _entry(self, key: str) -> ConvEntry:
@@ -528,7 +534,7 @@ class GovernorController:
         sig = wire_signature(sent_messages)
         with self._lock:
             entry = self._entry(key)
-            kind, _pos = classify_wire_diff(entry.sent_sig or None, sig)
+            kind, pos = classify_wire_diff(entry.sent_sig or None, sig)
             if kind == KIND_NEW:
                 self._breaks[CAUSE_NEW] += 1
             elif kind != KIND_APPEND:
@@ -536,6 +542,23 @@ class GovernorController:
                     self._breaks[observation.cause] += 1
                 else:
                     self._breaks[CAUSE_OWN] += 1
+                    # WHERE, not just how many. classify_wire_diff already
+                    # computes the first divergent message index and it used to
+                    # be discarded, so every own-mutation post-mortem had to be
+                    # inferred from llama-server logs. A run of breaks at ONE
+                    # site is the signature of a specific mutation (a lost
+                    # windowing frontier re-cutting at protect_first_n; a recall
+                    # block refreshing off-epoch); a scatter is churn. Bounded
+                    # ring + histogram, both cheap.
+                    site = f"{kind}@{pos}"
+                    self._own_sites[site] += 1
+                    self._own_recent.append({
+                        "conv": key,
+                        "kind": kind,
+                        "pos": pos,
+                        "n_prev": len(entry.sent_sig or ()),
+                        "n_sent": len(sig),
+                    })
             entry.sent_sig = sig
 
     # --------------------------------------------------------- response side
@@ -591,12 +614,41 @@ class GovernorController:
                 self._responses_with_timings += 1
                 if prompt_n >= 0 and prompt_tokens > 0:
                     entry.last_prompt_n = prompt_n
+                if prompt_ms > 0:
+                    entry.last_prompt_ms = prompt_ms
+            # PREFIX REUSE, portably (2026-08-02). This whole computation used
+            # to sit inside `if timings:` -- and timings is a llama.cpp
+            # extension. On vLLM or LM Studio the closed loop recorded NO reuse
+            # at all, which silently blinds break attribution, own-mutation
+            # forensics and every ratio built on them.
+            #
+            #   usage.prompt_tokens_details.cached_tokens   OpenAI STANDARD
+            #   timings.prompt_n                            llama.cpp only
+            #
+            # They carry the same information from opposite ends:
+            #   reuse = cached_tokens / prompt_tokens
+            #   reuse = 1 - prompt_n / prompt_tokens
+            # Presence of the field decides, not its value -- a legitimate
+            # cached_tokens of 0 is a real observation of zero reuse, and must
+            # not fall through to a path that may not exist.
+            if prompt_tokens > 0:
+                details = usage.get("prompt_tokens_details")
+                has_cached = (isinstance(details, dict)
+                              and "cached_tokens" in details)
+                reuse = None
+                if has_cached:
+                    cached = _as_int(details.get("cached_tokens"))
+                    reuse = cached / prompt_tokens
+                    if not timings:
+                        # Keep "tokens actually reprocessed" meaningful without
+                        # the vendor field it used to come from.
+                        entry.last_prompt_n = max(0, prompt_tokens - cached)
+                elif timings and prompt_n >= 0:
                     reuse = 1.0 - (prompt_n / prompt_tokens)
+                if reuse is not None:
                     reuse = max(0.0, min(1.0, reuse))
                     entry.reuse_history.append(reuse)
                     self._last_reuse_ratio = reuse
-                if prompt_ms > 0:
-                    entry.last_prompt_ms = prompt_ms
 
     # ------------------------------------------------------- 14c calibration
     @staticmethod
@@ -711,6 +763,8 @@ class GovernorController:
                 "real_reuse_ratio": (round(self._last_reuse_ratio, 4)
                                      if self._last_reuse_ratio is not None else None),
                 "breaks_by_cause": dict(self._breaks),
+                "own_mutation_sites": dict(self._own_sites),
+                "own_mutation_recent": list(self._own_recent),
                 "native_compaction_observed": self._native_compactions,
                 "pending_ceiling_samples": len(self._pending_ceiling),
                 "learned_ceilings": {

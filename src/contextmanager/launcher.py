@@ -65,9 +65,46 @@ def load_config_file(path: Optional[str]) -> dict:
         raise LauncherError(f"malformed TOML in {path}: {exc}") from exc
 
 
-def resolve_config(opts: dict, file_cfg: Optional[dict] = None) -> ProxyConfig:
+# Config file names/locations searched when --config is not given, in order.
+# CWD first (the conventional spot), then integration/ (where the shipped example
+# lives, and where a machine's real config naturally ends up next to it).
+_CONFIG_SEARCH = ("governor.toml", os.path.join("integration", "governor.toml"))
+
+
+def discover_config_file(start: Optional[str] = None) -> Optional[str]:
+    """First existing config in the search path, or None.
+
+    WHY (2026-08-02): the launcher only ever read a config when handed --config,
+    so making a setting permanent meant editing whatever script happened to start
+    the governor. On this machine that turned out to be neither of the two
+    launchers in the repo — governor-guard.vbs is a stale generation, and the
+    scheduled task install-governor-guard.ps1 describes was never registered — so
+    "add the flag to the wrapper" had no single correct answer.
+
+    Auto-discovery removes the question: any launch path picks the file up.
+    Deliberately CWD-relative (predictable, and the launchers all set the project
+    root as their working directory) rather than searching install locations,
+    which could silently adopt an unrelated file.
+
+    A no-op when no config exists, so behaviour is unchanged for anyone without
+    one; an EXPLICIT --config always wins and is never second-guessed.
+    """
+    base = start or os.getcwd()
+    for rel in _CONFIG_SEARCH:
+        candidate = os.path.join(base, rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def resolve_config(opts: dict, file_cfg: Optional[dict] = None,
+                   config_path: Optional[str] = None) -> ProxyConfig:
     """Resolve a ProxyConfig from layered sources (see module docstring). The selected
-    provider supplies the upstream URL and (from its ``api_key_env``) the API key."""
+    provider supplies the upstream URL and (from its ``api_key_env``) the API key.
+
+    ``config_path`` anchors relative paths that came from the config FILE; see the
+    store_root note below. Optional so existing callers keep working.
+    """
     file_cfg = file_cfg or {}
     resolved: dict = {}
 
@@ -75,6 +112,31 @@ def resolve_config(opts: dict, file_cfg: Optional[dict] = None) -> ProxyConfig:
     for key, value in (file_cfg.get("proxy") or {}).items():
         if key in _PROXY_FIELDS:
             resolved[key] = value
+
+    # A relative store_root written in a CONFIG FILE is anchored to that file's
+    # directory, NOT the process CWD.
+    #
+    # WHY (2026-08-03): `store_root = "./contextstore"` in integration/governor.toml
+    # was resolved with os.path.abspath() against whatever directory the launcher
+    # happened to start in, so the SAME config file addressed two different stores:
+    # run-governor.ps1 invoked from integration/ used integration/contextstore
+    # (90 notes), while governor-guard.vbs, which sets workDir to the repo root,
+    # used ./contextstore. The operator reset one and the governor silently began
+    # writing to the other — twice, on consecutive days. Every "corpus 0" baseline
+    # taken that way was unverifiable, and a recall corpus believed to be reset
+    # could still be serving slices from a previous project.
+    #
+    # A state directory whose identity depends on the caller's CWD is the same
+    # machine-specific coupling this file removes everywhere else. An explicit
+    # --store-root flag keeps shell semantics (relative to CWD) because that is
+    # what someone typing a path in a terminal means; Layer 3 below applies after
+    # this and so still wins.
+    if config_path and isinstance(resolved.get("store_root"), str):
+        if not os.path.isabs(resolved["store_root"]):
+            resolved["store_root"] = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(config_path)),
+                resolved["store_root"],
+            ))
 
     # Layer 2: the selected provider profile (built-in, overlaid by [providers.<name>]).
     provider = opts.get("provider")
@@ -140,6 +202,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--store-root", dest="store_root")
     p.add_argument("--handle-threshold-tokens", dest="handle_threshold_tokens", type=int)
     p.add_argument("--handle-threshold-ratio", dest="handle_threshold_ratio", type=float)
+    p.add_argument("--handleize-content-parts", dest="handleize_content_parts",
+                   action="store_true", default=None,
+                   help="stub oversized TEXT parts inside content-parts"
+                        " lists (opencode-shaped wires); images untouched")
     p.add_argument("--context-budget-ratio", dest="context_budget_ratio", type=float)
     p.add_argument("--context-target-ratio", dest="context_target_ratio", type=float)
     p.add_argument("--context-emergency-ratio", dest="context_emergency_ratio", type=float)
@@ -196,9 +262,11 @@ def main(argv: Optional[list] = None) -> None:
                                    else f"no wiring state to revert for {cli}"))
         return
 
+    config_path = opts.get("config") or discover_config_file()
+    auto_found = config_path is not None and not opts.get("config")
     try:
-        file_cfg = load_config_file(opts.get("config"))
-        config = resolve_config(opts, file_cfg)
+        file_cfg = load_config_file(config_path)
+        config = resolve_config(opts, file_cfg, config_path)
     except LauncherError as exc:
         parser.error(str(exc))
 
@@ -215,7 +283,16 @@ def main(argv: Optional[list] = None) -> None:
         sys.stdout.write("\n")
         return
 
+    # Name the config in effect: a silently auto-loaded file is worse than no
+    # auto-loading at all.
+    if config_path:
+        print(f"run-governor: config {config_path}"
+              + (" (auto-discovered)" if auto_found else ""))
     print(f"run-governor: {config.listen_host}:{config.listen_port} -> {config.upstream_base_url}")
+    # ALWAYS name the store, absolutely. Two stores were addressed by one config
+    # for two days because this line did not exist and nothing else showed which
+    # directory was live.
+    print(f"run-governor: store {store_abs}")
 
     # PERSISTENT wiring: set the CLI up to use the governor (provider/base_url + MCP) and leave
     # it wired after exit, so "pull repo -> run-governor --cli X" is a one-time setup. Idempotent

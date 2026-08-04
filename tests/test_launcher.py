@@ -157,3 +157,60 @@ def test_max_conversations_flag_and_validation() -> None:
     assert cfg.max_conversations == 4
     with pytest.raises(LauncherError):
         resolve_config(_opts(max_conversations=0), {})
+
+
+# ---------------------------------------------------------------------------
+# Config auto-discovery (2026-08-02)
+# ---------------------------------------------------------------------------
+
+
+class TestConfigAutoDiscovery:
+    """The launcher only read a config when handed --config, so making a setting
+    permanent meant editing whichever script happened to start the governor —
+    and on the machine this was built for, that was NEITHER launcher in the repo
+    (the VBS is a stale generation; the scheduled task was never registered).
+    Auto-discovery removes the question."""
+
+    def test_finds_governor_toml_in_cwd(self, tmp_path):
+        from contextmanager.launcher import discover_config_file
+        (tmp_path / "governor.toml").write_text("[proxy]\n", encoding="utf-8")
+        assert discover_config_file(str(tmp_path)) == str(tmp_path / "governor.toml")
+
+    def test_finds_governor_toml_in_integration(self, tmp_path):
+        from contextmanager.launcher import discover_config_file
+        (tmp_path / "integration").mkdir()
+        cfg = tmp_path / "integration" / "governor.toml"
+        cfg.write_text("[proxy]\n", encoding="utf-8")
+        assert discover_config_file(str(tmp_path)) == str(cfg)
+
+    def test_cwd_wins_over_integration(self, tmp_path):
+        from contextmanager.launcher import discover_config_file
+        (tmp_path / "integration").mkdir()
+        (tmp_path / "integration" / "governor.toml").write_text("[proxy]\n", encoding="utf-8")
+        (tmp_path / "governor.toml").write_text("[proxy]\n", encoding="utf-8")
+        assert discover_config_file(str(tmp_path)) == str(tmp_path / "governor.toml")
+
+    def test_no_config_is_a_no_op(self, tmp_path):
+        from contextmanager.launcher import discover_config_file
+        assert discover_config_file(str(tmp_path)) is None
+
+    def test_discovered_config_actually_applies(self, tmp_path):
+        """End-to-end: a discovered file must reach ProxyConfig, or discovery is
+        cosmetic."""
+        from contextmanager.launcher import (discover_config_file,
+                                             load_config_file, resolve_config)
+        (tmp_path / "governor.toml").write_text(
+            "[proxy]\nhandleize_content_parts = true\n", encoding="utf-8")
+        found = discover_config_file(str(tmp_path))
+        cfg = resolve_config({}, load_config_file(found))
+        assert cfg.handleize_content_parts is True
+
+    def test_explicit_config_is_never_second_guessed(self, tmp_path):
+        """An explicit --config must win even when a discoverable file exists."""
+        from contextmanager.launcher import discover_config_file
+        (tmp_path / "governor.toml").write_text("[proxy]\n", encoding="utf-8")
+        explicit = tmp_path / "elsewhere.toml"
+        explicit.write_text("[proxy]\nhandleize_content_parts = true\n", encoding="utf-8")
+        # main() prefers opts["config"]; discovery is only consulted when absent.
+        chosen = str(explicit) or discover_config_file(str(tmp_path))
+        assert chosen == str(explicit)

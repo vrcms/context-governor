@@ -39,6 +39,10 @@ def _cfg(tmp_path, **over):
         stub_preview_chars=20,
         rehydrate_budget_tokens=4000,
         request_timeout=30.0,
+        # OFF in production since 2026-08-03 (the model imitates the stub in its
+        # next tool call). These tests cover the machinery, which is unchanged
+        # and must stay correct for whenever it becomes safe to re-enable.
+        handleize_toolcall_args=True,
     )
     kw.update(over)
     return ProxyConfig(**kw)

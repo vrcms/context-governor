@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
+from typing import Optional
 
 # Rough chars-per-token for the FREE (no-tokenizer) wire-savings estimate on /metrics.
 # ~4 chars/token matches the project's HeuristicTokenCounter; fields are labeled "_est"
@@ -100,7 +101,11 @@ class StatsCollector:
         with self._lock:
             self._stats.loop_hard_stops += 1
 
-    def snapshot(self) -> dict:
+    def snapshot(self, real_peak_prompt_tokens: Optional[int] = None) -> dict:
+        """Cumulative counters. ``real_peak_prompt_tokens``, when supplied by the
+        caller from sensing's observed maximum, replaces the ESTIMATED peak in
+        the summary — see the scope note below for why the estimate alone was
+        misleading."""
         with self._lock:
             s = self._stats
             requests = s.requests
@@ -128,17 +133,38 @@ class StatsCollector:
         tokens_saved = chars_saved // cpt
         peak_tokens = peak_chars_out // cpt
         pct = round(chars_saved / chars_in * 100.0, 1) if chars_in else 0.0
-        summary = (
-            "no requests yet" if requests == 0 else
-            f"saved ~{_human(tokens_saved)} tokens (~{pct:.0f}%) over {requests} "
-            f"requests; peak prompt ~{_human(peak_tokens)} tokens"
-        )
+        if requests == 0:
+            summary = "no requests yet"
+        else:
+            # The savings figure is over message content, which is the only part
+            # the governor can shed -- say so, rather than let ~80% read as
+            # "80% of the prompt".
+            summary = (f"saved ~{_human(tokens_saved)} tokens of message content "
+                       f"(~{pct:.0f}%) over {requests} requests")
+            if real_peak_prompt_tokens:
+                summary += f"; peak prompt {_human(int(real_peak_prompt_tokens))} tokens"
+            else:
+                summary += (f"; peak message content ~{_human(peak_tokens)} tokens "
+                            "(prompt size unobserved)")
         base.update({
             "tokens_in_est": chars_in // cpt,
             "tokens_out_est": chars_out // cpt,
             "tokens_saved_est": tokens_saved,
             "pct_saved": pct,
-            "peak_prompt_tokens_est": peak_tokens,
+            # RENAMED 2026-08-02. This was "peak_prompt_tokens_est", which read
+            # as the peak PROMPT size and is not: every char here comes from
+            # message content, while /diagnostics measures message content at
+            # only 27-35% of the wire. The tools array (40-57%) and the chat
+            # template are invisible to it. Live consequence: 9,558 reported
+            # against a real 37,864 -- a 4x under-report on a field named for
+            # the prompt.
+            "peak_message_tokens_est": peak_tokens,
+            # Scope, machine-readable, so the limitation travels with the data
+            # instead of living in a docstring nobody reads at 2am.
+            "est_scope": ("message content only; excludes the tools array, "
+                          "tool_calls and chat-template scaffolding"),
             "summary": summary,
         })
+        if real_peak_prompt_tokens:
+            base["peak_prompt_tokens"] = int(real_peak_prompt_tokens)
         return base

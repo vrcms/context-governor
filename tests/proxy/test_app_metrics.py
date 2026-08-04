@@ -76,9 +76,31 @@ async def test_metrics_reports_token_estimates_and_summary(make_app):
     assert m["tokens_in_est"] == m["chars_in"] // 4
     assert m["tokens_out_est"] == m["chars_out"] // 4
     assert m["tokens_saved_est"] == m["chars_saved"] // 4
-    assert m["peak_prompt_tokens_est"] == m["chars_out"] // 4  # one request -> peak == it
+    # RENAMED 2026-08-02: this was peak_prompt_tokens_est, which read as the peak
+    # PROMPT size and is not -- every char here is message content, measured by
+    # /diagnostics at 27-35% of the wire, with the tools array and chat template
+    # invisible. It under-reported 9,558 against a real 37,864.
+    assert m["peak_message_tokens_est"] == m["chars_out"] // 4  # one request -> peak == it
+    assert "peak_prompt_tokens_est" not in m, "the misleading name must not come back"
     assert isinstance(m["pct_saved"], (int, float))
+    assert "message content" in m["est_scope"]
     assert isinstance(m["summary"], str) and "tokens" in m["summary"]
+    # The summary must SAY the savings are over message content, so ~80% cannot
+    # be read as "80% of the prompt".
+    assert "message content" in m["summary"]
+
+
+@pytest.mark.asyncio
+async def test_summary_prefers_the_observed_prompt_peak(make_app):
+    """When sensing has seen a real prompt size, the summary reports THAT rather
+    than an estimate over message content."""
+    app, upstream, store, rewriter = make_app(
+        response={**FAKE_RESPONSE, "usage": {"prompt_tokens": 4321, "completion_tokens": 1}})
+    await _post(app, {"messages": [{"role": "user", "content": BULKY}]})
+    m = (await _get(app, "/metrics")).json()
+    assert m.get("peak_prompt_tokens") == 4321
+    assert "peak prompt" in m["summary"]
+    assert "unobserved" not in m["summary"]
 
 
 @pytest.mark.asyncio
@@ -105,4 +127,46 @@ async def test_metrics_includes_retrieval_block(make_app):
     assert "recall_hit_rate" in r
     assert "avg_search_ms" in r
     assert "slices_recalled" in m          # proxy-level recall counter (Phase 10)
-    assert upstream.get_paths == []
+    # The CHAT path may lazily probe /props when n_ctx is unknown (_ensure_n_ctx:
+    # losing the startup race with llama-server used to disable windowing for the
+    # life of the process). What this pins is narrower and unchanged — /metrics
+    # ITSELF never touches upstream.
+    before = list(upstream.get_paths)
+    (await _get(app, "/metrics")).json()
+    assert upstream.get_paths == before
+
+
+@pytest.mark.asyncio
+async def test_metrics_exposes_upstream_context_sizing(make_app):
+    """Every setpoint derives from the upstream's n_ctx, and n_ctx being
+    unresolved does not merely soften the threshold — it disables windowing
+    outright. That used to be discoverable only by reading code; `resolved` and
+    `windowing_enabled` say it in one field each."""
+    app, upstream, store, rewriter = make_app(response=FAKE_RESPONSE)
+    await _post(app, {"messages": [{"role": "user", "content": BULKY}]})
+    m = (await _get(app, "/metrics")).json()
+    uc = m["upstream_context"]
+    assert set(uc) >= {
+        "n_ctx", "resolved", "source", "adoptions",
+        "handle_threshold_tokens", "windowing_enabled",
+    }
+    assert uc["resolved"] is bool(uc["n_ctx"])
+    # Whatever the fake upstream advertises, the reported threshold must be the
+    # one the rewriter is ACTUALLY using — not the static config default.
+    assert uc["handle_threshold_tokens"] == rewriter.config.handle_threshold_tokens
+
+
+@pytest.mark.asyncio
+async def test_bracket_agrees_with_the_reported_window(make_app):
+    """The lifespan probe used to set app.state.n_ctx directly and bypass the
+    resolver, so /metrics reported a window beside a bracket reading
+    "unresolved" -- the belief and the evidence behind it disagreeing on the
+    surface whose whole job is making the belief auditable."""
+    app, upstream, store, rewriter = make_app(response=FAKE_RESPONSE)
+    await _post(app, {"messages": [{"role": "user", "content": BULKY}]})
+    uc = (await _get(app, "/metrics")).json()["upstream_context"]
+    bracket = uc.get("bracket")
+    assert bracket is not None
+    if uc["n_ctx"]:
+        assert bracket["resolved"] is True, "window reported but bracket unresolved"
+        assert bracket["window"] == uc["n_ctx"]

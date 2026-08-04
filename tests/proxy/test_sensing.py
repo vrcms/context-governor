@@ -278,6 +278,45 @@ class TestBreakAttribution:
         ctrl.note_sent(obs2.key, mutated, observation=obs2)
         assert ctrl.snapshot()["breaks_by_cause"][CAUSE_OWN] == 1
 
+    def test_own_mutation_records_where(self):
+        """Counting own-mutations says a fix is needed; LOCATING them says which
+        rewrite to fix. classify_wire_diff already computes the first divergent
+        index — it used to be discarded, so every post-mortem was inferred from
+        server-side prefill timings instead of read off /metrics."""
+        ctrl = GovernorController()
+        t1 = _conv("hello parser work")
+        obs1 = ctrl.observe_request(t1)
+        ctrl.note_sent(obs1.key, t1, observation=obs1)
+        prev = t1
+        for extra in ("next", "again"):
+            nxt = prev + [{"role": "user", "content": extra}]
+            obs = ctrl.observe_request(nxt)
+            assert obs.prefix_broken is False
+            mutated = [nxt[0], {"role": "user", "content": f"ours {extra}"}] + nxt[2:]
+            ctrl.note_sent(obs.key, mutated, observation=obs)
+            prev = nxt
+        snap = ctrl.snapshot()
+        assert snap["breaks_by_cause"][CAUSE_OWN] == 2
+        sites = snap["own_mutation_sites"]
+        assert sum(sites.values()) == 2
+        assert all("@" in site for site in sites)
+        recent = snap["own_mutation_recent"]
+        assert len(recent) == 2
+        assert {"conv", "kind", "pos", "n_prev", "n_sent"} <= set(recent[0])
+
+    def test_own_mutation_sites_absent_when_clean(self):
+        """A conversation that only ever appends records no sites at all."""
+        ctrl = GovernorController()
+        t1 = _conv("hello parser work")
+        obs1 = ctrl.observe_request(t1)
+        ctrl.note_sent(obs1.key, t1, observation=obs1)
+        t2 = t1 + [{"role": "user", "content": "next"}]
+        obs2 = ctrl.observe_request(t2)
+        ctrl.note_sent(obs2.key, t2, observation=obs2)
+        snap = ctrl.snapshot()
+        assert snap["own_mutation_sites"] == {}
+        assert snap["own_mutation_recent"] == []
+
     def test_harness_edit_attributed(self):
         ctrl = GovernorController()
         contents = [f"m{i}" for i in range(9)]
@@ -543,3 +582,64 @@ class TestCeilingLearning:
         ctrl = GovernorController()
         ctrl.maybe_persist(store)   # nothing learned -> no write
         assert not (tmp_path / "state.json").exists()
+
+
+class TestPortableReuseMeasurement:
+    """Prefix reuse used to be computed only inside `if timings:` — and timings is
+    a llama.cpp extension. On vLLM or LM Studio the closed loop recorded NO reuse
+    at all, silently blinding break attribution and every ratio built on it.
+    usage.prompt_tokens_details.cached_tokens is the OpenAI-standard equivalent."""
+
+    def _ctrl_with(self, parsed):
+        ctrl = GovernorController()
+        t = _conv("hello parser work")
+        obs = ctrl.observe_request(t)
+        ctrl.note_sent(obs.key, t, observation=obs)
+        ctrl.observe_response(obs.key, parsed)
+        return ctrl
+
+    def test_reuse_from_cached_tokens_without_any_timings(self):
+        """The vLLM / LM Studio shape: usage only, no vendor timings block."""
+        ctrl = self._ctrl_with({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 900}}})
+        snap = ctrl.snapshot()
+        assert snap["real_reuse_ratio"] == 0.9, (
+            "no reuse recorded without llama.cpp timings — the closed loop is "
+            "blind on every other provider"
+        )
+        assert snap["responses_with_timings"] == 0
+
+    def test_zero_cached_tokens_is_a_real_observation(self):
+        """Presence of the field decides, not its value: a legitimate 0 is an
+        observation of zero reuse, not a reason to fall through to a vendor path
+        that may not exist."""
+        ctrl = self._ctrl_with({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 0}}})
+        assert ctrl.snapshot()["real_reuse_ratio"] == 0.0
+
+    def test_llama_cpp_timings_still_work_when_no_cached_tokens(self):
+        ctrl = self._ctrl_with({
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 10},
+            "timings": {"prompt_n": 250, "prompt_ms": 100.0}})
+        snap = ctrl.snapshot()
+        assert snap["real_reuse_ratio"] == 0.75
+        assert snap["responses_with_timings"] == 1
+
+    def test_both_present_agree(self):
+        """llama.cpp reports both; the two formulations must not disagree."""
+        ctrl = self._ctrl_with({
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 10,
+                      "prompt_tokens_details": {"cached_tokens": 750}},
+            "timings": {"prompt_n": 250, "prompt_ms": 100.0}})
+        assert ctrl.snapshot()["real_reuse_ratio"] == 0.75
+
+    def test_prompt_n_is_still_meaningful_without_timings(self):
+        """last_prompt_n means 'tokens actually reprocessed'; keep it filled from
+        the standard field so /metrics does not read 0 on a non-llama.cpp server."""
+        ctrl = self._ctrl_with({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 900}}})
+        conv = list(ctrl.snapshot()["conversations"].values())[0]
+        assert conv["last_prompt_n"] == 100

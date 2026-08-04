@@ -173,6 +173,15 @@ class WireDiagnostics:
         self.enabled = enabled
         self.tokenize = tokenize
         self._samples: "deque[WireSample]" = deque(maxlen=max(1, max_samples))
+        # TRUE running peak, held OUTSIDE the ring (2026-08-02). peak_request
+        # used to be max() over the retained samples, so once the ring rolled
+        # the real peak was evicted and the field silently became "largest of
+        # the last N". Live consequence: /diagnostics reported a 7,794-token
+        # peak while sensing's independent maximum for the same run was 58,682
+        # — a 7x under-report, on the number every sizing decision is sanity-
+        # checked against. One retained sample; the pairing property is
+        # untouched because this IS one real sample carrying both figures.
+        self._peak: Optional[WireSample] = None
         self._by_seq: dict = {}
         self._seq = 0
         self._lock = Lock()
@@ -236,6 +245,12 @@ class WireDiagnostics:
             sample = self._by_seq.get(seq)
             if sample is not None:
                 sample.real_prompt_tokens = value
+                # Peak is decided here, not at snapshot time: this is when a
+                # sample first HAS a token count, and the only moment it is
+                # guaranteed to still be in the ring.
+                if (self._peak is None
+                        or value > (self._peak.real_prompt_tokens or 0)):
+                    self._peak = sample
 
     # -------------------------------------------------------------- read path
 
@@ -261,8 +276,15 @@ class WireDiagnostics:
                                   "— paired samples are the only valid basis for a split")
             return out
 
-        peak = max(paired, key=lambda s: s.real_prompt_tokens or 0)
+        # The TRUE peak, which may have been evicted from the ring long ago.
+        peak = self._peak or max(paired, key=lambda s: s.real_prompt_tokens or 0)
         out["peak_request"] = peak.as_row()
+        # The ring-local maximum, named so it can never be mistaken for a peak.
+        # Kept because the component shares below are a recent-window mean, and
+        # comparing them against a peak from outside that window is misleading.
+        retained = max(paired, key=lambda s: s.real_prompt_tokens or 0)
+        if retained.seq != peak.seq:
+            out["peak_retained_request"] = retained.as_row()
 
         # Mean component share across paired samples. Shares, not absolutes:
         # averaging absolute sizes across differently-sized requests hides the

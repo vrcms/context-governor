@@ -22,7 +22,7 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from typing import Optional
 
 from ..types import Message, TokenCounter
@@ -318,6 +318,19 @@ class PromptRewriter:
         # the refresh rides the break for free) or a hard bound is hit (growth
         # past recall_max_stale_tokens, anchor loss).
         self._recall_frozen: "OrderedDict[str, tuple]" = OrderedDict()
+        # PINNED handle-ization threshold (2026-08-02), conv_key -> tokens. The
+        # threshold is derived from the upstream's n_ctx, and n_ctx can CHANGE
+        # under us (llama-server restarted with a different -c). Re-cutting a
+        # live conversation with a new threshold breaks its prefix in EITHER
+        # direction — see _pinned_threshold — so it is frozen at first sight.
+        self._threshold: "OrderedDict[str, int]" = OrderedDict()
+        # PINNED tool_call ARGUMENT threshold (2026-08-03), conv_key -> tokens.
+        # Pinned for exactly the same reason as _threshold: it is derived from
+        # n_ctx, and lowering it under a live conversation turns arguments
+        # already sent verbatim into stubs — an own-mutation on every affected
+        # message at once. Kept as its own cache rather than folded into
+        # _threshold so the two setpoints can move independently.
+        self._tc_threshold: "OrderedDict[str, int]" = OrderedDict()
 
     # ------------------------------------------------------------------ ids
     @staticmethod
@@ -348,6 +361,43 @@ class PromptRewriter:
         cap = self.config.max_conversations
         while len(cache) > cap:
             cache.popitem(last=False)
+
+    def _touch_conversation(self, conv_key: str) -> None:
+        """Mark this conversation most-recent in EVERY per-conversation cache.
+
+        THE BUG THIS FIXES (measured 2026-08-02). All three sticky caches are
+        READ with ``.get()`` — Pass 3a's windowing frontier, the missed-low-water
+        latch, the frozen recall block — but were only ever LRU-touched on the
+        paths that WRITE them (a windowing trigger, a recall rebuild). So the
+        HEALTHY steady state — frontier re-applied byte-identically, recall block
+        reused frozen, no trigger — never refreshed recency: **a conversation
+        aged toward eviction precisely because it was behaving.** Meanwhile every
+        one-shot side-call (title/summary generation) inserts a fresh key and
+        pushes it further back. The 2026-08-02 session ran 28 distinct
+        conversations against ``max_conversations = 32``.
+
+        Losing ``_windowed`` is not a cache miss, it is a REGRESSION. Every
+        previously-windowed message returns to the wire verbatim, so:
+
+            Pass 3a re-applies nothing -> wire jumps by the full original mass
+            -> pressure crosses the high water -> Pass 3b re-windows the SAME
+            messages -> prefix breaks at protect_first_n -> full re-prefill
+
+        which is recorded as an ``own-mutation`` and costs a ~25 s re-read of a
+        30 K prompt. The next turn can evict it again, which is what a run of
+        breaks at one fixed position looks like from the server side.
+
+        Touching on READ is what makes handle-ization **monotonic under
+        interleaving**: a conversation being actively rewritten can no longer
+        have its frontier evicted by conversations that are merely newer. Within
+        a live key the frontier was already monotonic (``_window_out`` only ever
+        adds to it); eviction was the sole path by which a message that had been
+        handle-ized could become un-handle-ized.
+        """
+        for cache in (self._windowed, self._window_latched,
+                      self._recall_frozen, self._threshold, self._tc_threshold):
+            if conv_key in cache:
+                self._lru_touch(cache, conv_key)
 
     # ---------------------------------------------------------------- stubs
     @staticmethod
@@ -544,7 +594,222 @@ class PromptRewriter:
         normal = self.make_stub(handle, role, tokens, content, self.config.stub_preview_chars)
         return diff_stub if len(diff_stub) < len(normal) else None
 
-    def _count_for_handleization(self, content: str) -> Optional[int]:
+    # ------------------------------------------------- dynamic context size
+    def update_context_size(self, n_ctx: Optional[int],
+                            handle_threshold_tokens: Optional[int]) -> bool:
+        """Adopt a new upstream context size WITHOUT losing sticky state.
+
+        ``n_ctx`` is probed from llama-server ``/props`` and every setpoint is
+        derived from it (handle threshold, high/low/emergency water). It used to
+        be sampled ONCE at startup and never again, so:
+
+          - llama-server down when the proxy started -> n_ctx None forever ->
+            the threshold silently falls back to the static default AND windowing
+            is disabled entirely (``high_water`` None), with nothing saying so;
+          - somebody restarts llama-server with a different ``-c`` -> the proxy
+            keeps sizing itself to a window that no longer exists. If n_ctx
+            SHRANK, the high water now sits above the real limit.
+
+        Rebuilding the rewriter to adopt a new size is not an option: it would
+        drop every windowing frontier and frozen recall block, breaking the
+        prefix of every live conversation at once. So the size is updated in
+        place and all per-conversation state is preserved.
+
+        Returns True iff anything actually changed.
+        """
+        changed = False
+        if n_ctx and int(n_ctx) != (self._n_ctx or 0):
+            self._n_ctx = int(n_ctx)
+            changed = True
+        if (handle_threshold_tokens
+                and int(handle_threshold_tokens)
+                != self.config.handle_threshold_tokens):
+            self.config = _dc_replace(
+                self.config, handle_threshold_tokens=int(handle_threshold_tokens)
+            )
+            changed = True
+        return changed
+
+    def _pinned_threshold(self, conv_key: str) -> int:
+        """The handle-ization threshold this conversation was FIRST seen with.
+
+        Applying a NEW threshold to a conversation already in flight re-cuts
+        every stub decision already made, in whichever direction it moved:
+
+            threshold DOWN -> messages sent verbatim become stubs
+            threshold UP   -> messages sent as stubs come back VERBATIM
+
+        The second is un-handle-ization — the regression this codebase spent
+        2026-08-02 eliminating — and both are a prefix break on every live
+        conversation simultaneously, i.e. exactly the storm a naive n_ctx
+        refresh would cause on every llama-server restart.
+
+        So the threshold is pinned per conversation at first sight and never
+        moves. A new n_ctx applies to conversations that START after it, which
+        is the only moment at which changing it is free.
+        """
+        t = self._threshold.get(conv_key)
+        if t is None:
+            t = self.config.handle_threshold_tokens
+            self._threshold[conv_key] = t
+            self._lru_touch(self._threshold, conv_key)
+        return t
+
+    def _toolcall_threshold(self) -> int:
+        """Current setpoint for stubbing a tool_call ARGUMENT value.
+
+            max( toolcall_min_shrink_ratio * stub_tokens , ratio * n_ctx )
+
+        Both terms are derived; neither is a tuned constant.
+
+        The RATIO term is the same anchoring every other setpoint uses, so the
+        governor self-sizes to whatever window the server actually runs. It is
+        much lower than the per-message ratio because this mass behaves
+        differently: tool_call arguments are invisible to Pass 3 windowing, so
+        they accumulate for the life of the conversation and are never shed.
+        Measured 2026-08-03 on the opencode capture, they reached 43% of the
+        peak prompt while the message threshold fired on none of them.
+
+        The FLOOR term is not a preference — it is the break-even of the
+        operation. A stub costs ~137 tokens to render, so stubbing anything
+        smaller makes the wire BIGGER. Without it, 0.004 * 8192 would set the
+        threshold at 33 tokens and every fire would be a net loss. Expressed
+        against `stub_tokens_estimate` so it tracks the stub format rather than
+        drifting from it, the same discipline as `window_min_shrink_ratio`.
+
+        With the defaults the floor dominates below ~68K of context and the
+        ratio takes over above it, which is the intended behaviour at both ends.
+        """
+        stub_tokens = self.stub_tokens_estimate(self.config.stub_preview_chars)
+        floor = int(self.config.toolcall_min_shrink_ratio * stub_tokens)
+        anchored = 0
+        ratio = self.config.toolcall_threshold_ratio
+        if ratio > 0 and self._n_ctx:
+            anchored = int(ratio * self._n_ctx)
+        return max(1, floor, anchored)
+
+    def _recall_stale_bound(self) -> int:
+        """Growth (in estimated tokens) the frozen recall block tolerates before
+        it is rebuilt, anchored to the real window.
+
+        A FIXED bound is three different policies on three servers: 4000 tokens
+        is 2% of a 200K window (rebuild almost every turn), 6% of 65K, and 50%
+        of 8K (never rebuild). Only the middle case was ever measured, and there
+        it forced ~12 rebuilds on a conversation growing to 46-49K — 6 of which
+        landed off-epoch and cost a prefix break. Every other setpoint in this
+        file is a fraction of n_ctx; this one was the exception.
+
+        NOT pinned per conversation, unlike the two handle-ization thresholds.
+        Those decide whether a message is a stub, so moving one re-cuts bytes
+        already on the wire. This one only decides WHEN to refresh a block, and
+        a refresh is a normal, already-handled event — it re-freezes at the new
+        tail rather than rewriting history.
+
+        `recall_max_stale_tokens = 0` means the operator selected legacy
+        per-turn recompute; a ratio must not silently re-enable stickiness they
+        turned off, so that answer is returned unchanged.
+        """
+        fixed = self.config.recall_max_stale_tokens
+        if fixed <= 0:
+            return 0
+        ratio = self.config.recall_max_stale_ratio
+        if ratio > 0 and self._n_ctx:
+            return max(1, int(ratio * self._n_ctx))
+        return fixed
+
+    def _pinned_toolcall_threshold(self, conv_key: str) -> int:
+        """`_toolcall_threshold` frozen at the conversation's first sight.
+
+        Same hazard as `_pinned_threshold`: n_ctx can move under a live
+        conversation, and a LOWER tool_call threshold would stub arguments that
+        have already gone out verbatim — a simultaneous own-mutation on every
+        message carrying one. Pinning confines a new setpoint to conversations
+        that start after it.
+        """
+        t = self._tc_threshold.get(conv_key)
+        if t is None:
+            t = self._toolcall_threshold()
+            self._tc_threshold[conv_key] = t
+            self._lru_touch(self._tc_threshold, conv_key)
+        return t
+
+    def _handleize_content_parts(self, parts, role: str,
+                                 handle_ized_ids: list,
+                                 threshold: Optional[int] = None) -> Optional[list]:
+        """Stub oversized TEXT parts inside an OpenAI content-parts list.
+
+        THE GAP THIS CLOSES (measured 2026-08-02). Pass 1 handle-izes only
+        ``isinstance(content, str)`` and ``_window_out`` skips anything that is
+        not a str, so a harness sending tool results as content-parts is
+        structurally invisible to the governor. One opencode run measured:
+
+            structured_content  66.3%    <- no code path
+            tools               17.6%    <- harness-owned, resent every turn
+            string_content      12.9%    <- the only thing we could reach
+
+        88 of 191 messages were handle-ized and the wire still climbed to 47 K,
+        because two thirds of it was in a shape we passed through untouched. The
+        windowing latch was not misbehaving — it correctly saw unsheddable mass
+        and stopped breaking the prefix for no gain.
+
+        SHAPE IS PRESERVED. The list stays a list and every part keeps its keys;
+        only an oversized ``text`` value is replaced by the ordinary stub string.
+        Flattening a parts array to a plain-string stub would be smaller, but
+        harnesses validate tool-result shapes, and a reshaped message is a
+        different message — a prefix break by construction, every turn.
+
+        NON-TEXT PARTS ARE NEVER TOUCHED. ``image_url`` (and anything whose
+        ``type`` is not ``"text"``) passes through by identity: stubbing an image
+        part would silently destroy multimodal input, which no token saving
+        justifies.
+
+        Deliberately NOT delta-compressed (``_maybe_diff_stub``): that base
+        depends on the order of earlier stubs, and one new variable at a time is
+        how this stays debuggable.
+
+        PURE: returns a NEW list only when something changed, sharing every
+        untouched part object; None when nothing did, so the caller keeps the
+        original message and the wire stays byte-identical.
+        IDEMPOTENT: a part whose text is already one of our markers is skipped,
+        so ``rewrite(rewrite(x)) == rewrite(x)``.
+        """
+        if not isinstance(parts, list):
+            return None
+        if threshold is None:
+            threshold = self.config.handle_threshold_tokens
+        out: list = []
+        changed = False
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                out.append(part)          # image_url & friends: identity
+                continue
+            text = part.get("text")
+            if not isinstance(text, str):
+                out.append(part)
+                continue
+            if (self.is_stub(text) or self.is_diff_stub(text)
+                    or self.is_rehydrated(text)):
+                out.append(part)          # already ours -> byte-identical
+                continue
+            tokens = self._count_for_handleization(text, threshold)
+            if tokens is None or tokens < threshold:
+                out.append(part)
+                continue
+            mid = self.stable_id(role, text)
+            handle = self.store.page_out(   # idempotent: same id -> same handle
+                Message(role=role, content=text, id=mid)
+            )
+            new_part = dict(part)
+            new_part["text"] = self.make_stub(
+                handle, role, tokens, text, self.config.stub_preview_chars
+            )
+            out.append(new_part)
+            handle_ized_ids.append(mid)
+            changed = True
+        return out if changed else None
+
+    def _count_for_handleization(self, content: str,
+                                 threshold: Optional[int] = None) -> Optional[int]:
         """Token count for the handle-ization decision, AVOIDING a /tokenize round-trip on
         the easy cases:
           - tokens <= chars ALWAYS, so content shorter than the threshold (in chars) can
@@ -556,7 +821,8 @@ class PromptRewriter:
         Returning None means "below threshold, leave it alone".
         """
         n = len(content)
-        threshold = self.config.handle_threshold_tokens
+        if threshold is None:
+            threshold = self.config.handle_threshold_tokens
         if n < threshold:
             return None
         cap = self.config.tokenize_max_chars
@@ -564,10 +830,10 @@ class PromptRewriter:
             return max(threshold, n // _EST_CHARS_PER_TOKEN)
         return self.counter.count_text(content)
 
-    def _handleize_tool_calls(self, tool_calls,
-                              handle_ized_ids: list) -> Optional[list]:
+    def _handleize_tool_calls(self, tool_calls, handle_ized_ids: list,
+                              threshold: int) -> Optional[list]:
         """Pass 1 extension: page out large STRING values found inside
-        ``tool_calls[].function.arguments``, mirroring the ``content`` threshold.
+        ``tool_calls[].function.arguments``.
 
         Returns a NEW list only when something was actually stubbed; ``None``
         means "leave tool_calls exactly as received" — re-serializing an
@@ -584,6 +850,16 @@ class PromptRewriter:
         That mass was invisible and unsheddable to the whole rewriter: pressure
         climbed to 96% of n_ctx even after windowing fired 4 times, because
         there was nothing left it was ALLOWED to touch.
+
+        `threshold` is the PINNED per-conversation tool_call setpoint, NOT
+        `handle_threshold_tokens`. It used to be the latter, which was wrong
+        twice over. Sizing: measured 2026-08-03, the per-message threshold
+        caught the handful of giants (10 stubs on the opencode capture — the
+        ledger's claim that this never fires was itself wrong) while missing a
+        mid-tail worth ~15,400 net tokens. Pinning: it read the LIVE config
+        value, so an n_ctx change mid-conversation re-cut arguments already sent
+        verbatim — the hazard `_pinned_threshold` exists to prevent, which this
+        path was silently exempt from.
 
         SAFETY (this is why it edits values in place rather than replacing the
         whole field): the OpenAI wire format for ``function.arguments`` is a
@@ -634,8 +910,8 @@ class PromptRewriter:
             for key, value in parsed.items():
                 if not isinstance(value, str):
                     continue
-                tokens = self._count_for_handleization(value)
-                if tokens is None or tokens < self.config.handle_threshold_tokens:
+                tokens = self._count_for_handleization(value, threshold)
+                if tokens is None or tokens < threshold:
                     continue
                 # Namespaced by arg name so a large "content" value and a large
                 # "diff" value never collide even if (improbably) byte-identical.
@@ -667,15 +943,23 @@ class PromptRewriter:
         return out
 
     def _append_with_tool_calls(self, rewritten: list, out_msg, msg,
-                                handle_ized_ids: list) -> None:
+                                handle_ized_ids: list, tc_threshold: int) -> None:
         """Append `out_msg` (Pass 1's role/content resolution for `msg`) to
         `rewritten`, first transforming any large tool_calls argument strings.
         `out_msg` keeps its ORIGINAL tool_calls untouched when nothing needed
         stubbing (see `_handleize_tool_calls`); non-dict `out_msg`/`msg` (the
-        defensive non-dict passthrough case) are left alone entirely."""
+        defensive non-dict passthrough case) are left alone entirely.
+
+        Gated OFF by default since 2026-08-03 (`handleize_toolcall_args`): a stub
+        placed in the model's own prior output becomes a template it imitates,
+        and the markers end up in the next shell command. See the config docstring
+        for the measurement."""
         tool_calls = msg.get("tool_calls") if isinstance(msg, dict) else None
-        if tool_calls is not None and isinstance(out_msg, dict):
-            new_tc = self._handleize_tool_calls(tool_calls, handle_ized_ids)
+        if (tool_calls is not None and isinstance(out_msg, dict)
+                and self.config.handleize_toolcall_args):
+            new_tc = self._handleize_tool_calls(
+                tool_calls, handle_ized_ids, tc_threshold
+            )
             if new_tc is not None:
                 out_msg["tool_calls"] = new_tc
         rewritten.append(out_msg)
@@ -749,6 +1033,18 @@ class PromptRewriter:
         # can no longer thrash one global slot. Computed AFTER the recall
         # strip so a rewrite of our own output maps to the same key.
         conv_key = conversation_key(messages)
+        # Refresh recency for ALL of this conversation's sticky state BEFORE any
+        # pass reads it. Reuse must count as use, or the steady state evicts
+        # itself and un-handle-izes messages it already paged out (see
+        # _touch_conversation).
+        self._touch_conversation(conv_key)
+        # Threshold PINNED to this conversation: n_ctx (and therefore the
+        # threshold) can move under a live conversation, and re-cutting its stub
+        # decisions mid-flight breaks the prefix in either direction.
+        threshold = self._pinned_threshold(conv_key)
+        # tool_call ARGUMENTS get their own, much lower setpoint — pinned for the
+        # same reason, and until 2026-08-03 not pinned at all.
+        tc_threshold = self._pinned_toolcall_threshold(conv_key)
 
         # ---- Pass 1: handle-ization (per-message deterministic) ----
         for msg in messages:
@@ -762,22 +1058,24 @@ class PromptRewriter:
                 h = self._primary_handle(content)
                 if h is not None:
                     recent_stubs.append((h, role))
-                self._append_with_tool_calls(rewritten, dict(msg), msg, handle_ized_ids)
+                self._append_with_tool_calls(rewritten, dict(msg), msg,
+                                             handle_ized_ids, tc_threshold)
                 continue
 
             if isinstance(content, str) and self.is_rehydrated(content):
                 # Already a synthetic rehydrated message from a prior turn:
                 # already-rewritten output. Pass through UNCHANGED (never
                 # handle-ize, never page out) — §9.1 idempotency fix.
-                self._append_with_tool_calls(rewritten, dict(msg), msg, handle_ized_ids)
+                self._append_with_tool_calls(rewritten, dict(msg), msg,
+                                             handle_ized_ids, tc_threshold)
                 continue
 
             if isinstance(content, str):
                 # ONE token measurement, and skip the /tokenize round-trip entirely on the
                 # easy/dangerous cases (tiny content can't be bulky; huge content is
                 # bulky-by-size and unsafe to tokenize). None => below threshold.
-                tokens = self._count_for_handleization(content)
-                if tokens is not None and tokens >= self.config.handle_threshold_tokens:
+                tokens = self._count_for_handleization(content, threshold)
+                if tokens is not None and tokens >= threshold:
                     mid = self.stable_id(role, content)
                     handle = self.store.page_out(  # idempotent: same id -> same handle
                         Message(role=role, content=content, id=mid)
@@ -790,10 +1088,28 @@ class PromptRewriter:
                             handle, role, tokens, content, self.config.stub_preview_chars
                         )
                     self._append_with_tool_calls(
-                        rewritten, {"role": role, "content": stub}, msg, handle_ized_ids
+                        rewritten, {"role": role, "content": stub}, msg,
+                        handle_ized_ids, tc_threshold
                     )
                     handle_ized_ids.append(mid)
                     recent_stubs.append((handle, role))
+                    continue
+
+            # Content-parts (opt-in): stub oversized TEXT parts in place, shape
+            # preserved, image parts untouched. Falls through to the plain
+            # passthrough below when nothing crossed the threshold, so an
+            # unchanged parts message keeps its ORIGINAL object and stays
+            # byte-identical on the wire.
+            if self.config.handleize_content_parts and isinstance(content, list):
+                new_parts = self._handleize_content_parts(
+                    content, role, handle_ized_ids, threshold
+                )
+                if new_parts is not None:
+                    out_msg = dict(msg)
+                    out_msg["content"] = new_parts
+                    self._append_with_tool_calls(
+                        rewritten, out_msg, msg, handle_ized_ids, tc_threshold
+                    )
                     continue
 
             # Pass through unchanged (covers non-string content too). This is
@@ -801,7 +1117,8 @@ class PromptRewriter:
             # content=None and tool_calls=[...] never matches any of the
             # isinstance(content, str) branches above.
             out_msg = dict(msg) if isinstance(msg, dict) else msg
-            self._append_with_tool_calls(rewritten, out_msg, msg, handle_ized_ids)
+            self._append_with_tool_calls(rewritten, out_msg, msg, handle_ized_ids,
+                                         tc_threshold)
 
         # ---- Pass 2: auto-rehydration of explicit references ----
         rehydrated_handles: list[str] = []
@@ -1094,7 +1411,7 @@ class PromptRewriter:
         recalled_handles: list[str] = []
         if (self.config.auto_recall_k > 0
                 and self.config.recall_budget_tokens > 0 and rewritten):
-            stale_bound = self.config.recall_max_stale_tokens
+            stale_bound = self._recall_stale_bound()
             # FLUSH EPOCH (Phase 14b): the prefix is already broken this turn —
             # by the harness (classifier verdict passed in as prefix_broken) or
             # by Pass 3 ACTUALLY PAGING a message (windowing_shed — that turn
@@ -1193,6 +1510,16 @@ class PromptRewriter:
         minimal = self.make_stub(handle, role, orig_tokens, content, 0)
         stub_tokens = self.counter.count_text(minimal)
         if stub_tokens >= orig_tokens:  # never bloat a tiny old message
+            return 0
+        # ...and never take a MARGINAL trade either. The break-even test above
+        # models ONLY tokens. Paging also breaks the upstream prefix (a full
+        # re-prefill of the whole prompt) and hides the content from the model —
+        # costs that test cannot see, so at break-even they are pure loss.
+        # Measured 2026-08-02: 27 messages under 100 tokens were paged for a net
+        # 39 tokens each, five of them assistant turns (the model's own prior
+        # reasoning). Require a real shrink, not merely a non-negative one.
+        ratio = self.config.window_min_shrink_ratio
+        if ratio > 0 and orig_tokens < ratio * stub_tokens:
             return 0
         self.store.page_out(Message(role=role, content=content, id=mid))
         # Frontier remembers the ORIGINAL count so Pass 3a can regenerate this

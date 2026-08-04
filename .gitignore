@@ -31,6 +31,11 @@ models/
 .cm_store/
 contextstore/            # default CM_STORE_ROOT for the proxy + mcp server
 **/contextstore/
+# ...and its timestamped backups. The patterns above match the exact name only,
+# so `contextstore.bak.20260803-111625/` was untracked AND unignored — 85 MB of
+# real session data that `git add -A` would have swept into a publish cut.
+contextstore.bak.*/
+**/contextstore.bak.*/
 store/runtime/
 data/runtime/
 *.sqlite
@@ -69,3 +74,17 @@ Thumbs.db
 # --- Generated analysis/scratch docs (local only; keep out of the add -A publish) ---
 projectmap_*.md
 PROJECT_REPORT.md
+_checkpoints/
+
+# live config: machine-specific paths (wire_capture_dir etc); use governor.example.toml as the template
+integration/governor.toml
+integration/*.bak.*
+integration/_wire/
+# wire captures wherever they are dumped: real agent traffic (tool output, file
+# paths, prompts). Matched by the capture filename convention, not by dir name,
+# so a new capture dir is covered the day it is created.
+req-[0-9]*-in.json
+req-[0-9]*-out.json
+integration/_watch*.jsonl
+integration/_governor*.log
+_runs/

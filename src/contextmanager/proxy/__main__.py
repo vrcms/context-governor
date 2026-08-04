@@ -59,6 +59,8 @@ def load_config_from_env() -> ProxyConfig:
         listen_port=_env_int("CM_LISTEN_PORT", 8900),
         handle_threshold_tokens=_env_int("CM_HANDLE_THRESHOLD_TOKENS", 2000),
         handle_threshold_ratio=_env_float("CM_HANDLE_THRESHOLD_RATIO", 0.02),
+        handleize_content_parts=_env_bool(
+            "CM_HANDLEIZE_CONTENT_PARTS", False),
         context_budget_ratio=_env_float("CM_CONTEXT_BUDGET_RATIO", 0.50),
         context_target_ratio=_env_float("CM_CONTEXT_TARGET_RATIO", 0.35),
         context_emergency_ratio=_env_float("CM_CONTEXT_EMERGENCY_RATIO", 0.0),

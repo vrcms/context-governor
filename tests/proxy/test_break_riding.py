@@ -25,6 +25,7 @@ from conftest import FakeCounter
 from contextmanager.durable import DurableStore
 from contextmanager.proxy.config import ProxyConfig
 from contextmanager.proxy.rewriter import PromptRewriter
+from contextmanager.proxy.sensing import conversation_key
 from contextmanager.types import Message
 
 
@@ -33,6 +34,14 @@ def _config(tmp_path, **over) -> ProxyConfig:
         upstream_base_url="http://upstream.test",
         store_root=str(tmp_path / "store"),
         handle_threshold_tokens=10,
+        # These suites drive windowing with deliberately TINY messages so the
+        # n_ctx=200 arithmetic stays legible (20 tokens vs an 8-token stub =
+        # 2.5x shrink). window_min_shrink_ratio defaults to 4.0, which
+        # correctly rejects trades that marginal — so it is disabled here to
+        # keep these tests about windowing MECHANICS. The floor itself is
+        # covered in test_window_floor.py, including an end-to-end shed at the
+        # production default.
+        window_min_shrink_ratio=0.0,
         stub_preview_chars=10,
         rehydrate_budget_tokens=4000,
         request_timeout=30.0,
@@ -433,3 +442,86 @@ class TestFutileCrossing:
         # 170 < 150 + 40 would have been suppressed had the latch survived.
         r4 = rw.rewrite_outgoing(t4, pressure_tokens=170)
         assert r4.windowing_triggered is True
+
+
+# ---------------------------------------------------------------------------
+# Monotonic handle-ization under interleaving (2026-08-02)
+# ---------------------------------------------------------------------------
+
+
+def _wire_for(tag: str):
+    """`_small_wire()` with a distinct first user turn -> distinct conv_key."""
+    w = [dict(m) for m in _small_wire()]
+    w[1] = {"role": "user", "content": f"start the work on {tag}"}
+    return w
+
+
+class TestFrontierSurvivesInterleaving:
+    """THE BUG (2026-08-02): ``_windowed`` — the sticky windowing frontier — was
+    read with ``.get()`` in Pass 3a and LRU-touched ONLY on a windowing TRIGGER.
+    So the healthy steady state (frontier re-applied byte-identically, no
+    trigger) never refreshed recency: a conversation aged toward eviction
+    precisely because it was behaving, while one-shot side-calls kept inserting
+    fresh keys ahead of it.
+
+    Eviction of the frontier is not a cache miss, it is a REGRESSION: every
+    previously-windowed message returns to the wire verbatim, breaking the
+    prefix and forcing the next turn to re-window the same messages — an
+    own-mutation, and a full re-prefill.
+
+    ``_recall_frozen`` was already touched on its reuse path; only ``_windowed``
+    had the hole, so the two desynchronized on exactly the conversations that
+    mattered most.
+    """
+
+    def _rw(self, tmp_path):
+        cfg, store, counter, rw = _rewriter(
+            tmp_path, n_ctx=200, handle_threshold_tokens=50,
+            context_budget_ratio=0.5, context_target_ratio=0.3,
+            auto_recall_k=0, max_conversations=2,
+        )
+        return rw
+
+    def test_reused_frontier_is_not_evicted_by_newer_conversations(self, tmp_path):
+        rw = self._rw(tmp_path)
+        a = _wire_for("alpha")
+        a_stubbed = rw.rewrite_outgoing(a, pressure_tokens=150)
+        assert a_stubbed.windowing_triggered is True
+
+        # A keeps being rewritten, below the trigger — the REUSE path. Pre-fix
+        # this did not count as use.
+        a2 = a + [{"role": "user", "content": "tail step g"}]
+        r = rw.rewrite_outgoing(a2, pressure_tokens=90)
+        assert r.windowing_triggered is False
+        assert r.messages[: len(a_stubbed.messages)] == a_stubbed.messages
+
+        # Two OTHER conversations each trigger and take a frontier slot, with
+        # an A reuse turn interleaved — the real shape of a main conversation
+        # alternating with title/summary side-calls.
+        rw.rewrite_outgoing(_wire_for("bravo"), pressure_tokens=150)
+        rw.rewrite_outgoing(a2, pressure_tokens=90)
+        rw.rewrite_outgoing(_wire_for("charlie"), pressure_tokens=150)
+
+        # A returns. Its frontier must still be there: the previously-windowed
+        # messages stay stubs and the wire still byte-extends the turn that
+        # first stubbed them.
+        a3 = a2 + [{"role": "user", "content": "tail step h"}]
+        final = rw.rewrite_outgoing(a3, pressure_tokens=90)
+        assert final.windowing_triggered is False, (
+            "frontier was lost: pressure had to re-trigger windowing"
+        )
+        assert final.messages[: len(a_stubbed.messages)] == a_stubbed.messages, (
+            "previously handle-ized messages returned verbatim — "
+            "handle-ization regressed, breaking the prefix"
+        )
+
+    def test_genuinely_idle_conversation_still_evicts(self, tmp_path):
+        """The cap must still bound memory: touching on READ protects ACTIVE
+        conversations, not abandoned ones."""
+        rw = self._rw(tmp_path)
+        a = _wire_for("alpha")
+        rw.rewrite_outgoing(a, pressure_tokens=150)
+        rw.rewrite_outgoing(_wire_for("bravo"), pressure_tokens=150)
+        rw.rewrite_outgoing(_wire_for("charlie"), pressure_tokens=150)
+        assert len(rw._windowed) == 2
+        assert conversation_key(a) not in rw._windowed

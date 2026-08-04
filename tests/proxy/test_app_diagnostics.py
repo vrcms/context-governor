@@ -242,3 +242,68 @@ async def test_diagnostic_failure_never_breaks_the_request(make_app):
     snap = (await _get(app, "/diagnostics")).json()
     assert snap["enabled"] is False
     assert "error" in snap
+
+
+# ---------------------------------------------------------------------------
+# True peak tracking (2026-08-02)
+# ---------------------------------------------------------------------------
+
+
+class TestPeakSurvivesRingEviction:
+    """peak_request was max() over the RETAINED ring, so once the ring rolled the
+    real peak was evicted and the field silently became "largest of the last N".
+
+    Live consequence: /diagnostics reported peak_request = 7,794 tokens while
+    sensing's independent running maximum for the same run was 58,682 — a 7x
+    under-report on the figure every sizing decision is sanity-checked against,
+    and it misled this project's own analysis until the two were compared.
+    """
+
+    def _diag(self, max_samples=4):
+        from contextmanager.proxy.diagnostics import WireDiagnostics
+        return WireDiagnostics(enabled=True, max_samples=max_samples)
+
+    def _feed(self, diag, prompt_tokens, marker="x"):
+        seq = diag.record_request({"messages": [{"role": "user", "content": marker}]})
+        diag.attach_usage(seq, prompt_tokens)
+        return seq
+
+    def test_peak_survives_after_the_ring_rolls(self):
+        diag = self._diag(max_samples=4)
+        self._feed(diag, 58682, "the big one")          # then push it out
+        for i in range(10):
+            self._feed(diag, 100 + i)
+        snap = diag.snapshot()
+        assert snap["peak_request"]["real_prompt_tokens"] == 58682, (
+            "the true peak was evicted with the ring — peak_request is reporting "
+            "the largest of a recent window, not a peak"
+        )
+
+    def test_ring_local_max_is_reported_under_a_name_that_says_so(self):
+        diag = self._diag(max_samples=4)
+        self._feed(diag, 58682)
+        for i in range(10):
+            self._feed(diag, 100 + i)
+        snap = diag.snapshot()
+        assert snap["peak_retained_request"]["real_prompt_tokens"] == 109
+        assert snap["peak_request"]["real_prompt_tokens"] == 58682
+
+    def test_no_retained_key_when_it_is_the_peak(self):
+        """Nothing extra to report while the peak is still in the ring."""
+        diag = self._diag(max_samples=8)
+        self._feed(diag, 500)
+        self._feed(diag, 900)
+        snap = diag.snapshot()
+        assert snap["peak_request"]["real_prompt_tokens"] == 900
+        assert "peak_retained_request" not in snap
+
+    def test_agrees_with_an_independent_running_maximum(self):
+        """The reconciliation that exposed the bug: diagnostics' peak must match
+        a plain running max over the same observations."""
+        import random
+        diag = self._diag(max_samples=8)
+        rng = random.Random(7)
+        values = [rng.randint(100, 60000) for _ in range(60)]
+        for v in values:
+            self._feed(diag, v)
+        assert diag.snapshot()["peak_request"]["real_prompt_tokens"] == max(values)

@@ -42,6 +42,14 @@ def _config(tmp_path, **over) -> ProxyConfig:
         upstream_base_url="http://upstream.test",
         store_root=str(tmp_path / "store"),
         handle_threshold_tokens=10,
+        # These suites drive windowing with deliberately TINY messages so the
+        # n_ctx=200 arithmetic stays legible (20 tokens vs an 8-token stub =
+        # 2.5x shrink). window_min_shrink_ratio defaults to 4.0, which
+        # correctly rejects trades that marginal — so it is disabled here to
+        # keep these tests about windowing MECHANICS. The floor itself is
+        # covered in test_window_floor.py, including an end-to-end shed at the
+        # production default.
+        window_min_shrink_ratio=0.0,
         stub_preview_chars=10,
         rehydrate_budget_tokens=4000,
         request_timeout=30.0,

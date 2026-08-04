@@ -34,6 +34,26 @@ class ProxyConfig:
             `-c` the server runs. 0 disables anchoring -> the fixed
             handle_threshold_tokens is always used. llama-server is the source of
             truth for context size, not the CLI.
+        handleize_toolcall_args: master switch for stubbing values inside
+            tool_call arguments. **Default False, and the default is the
+            finding.** Unlike message content, `arguments` is the model's own
+            prior output, so a stub there is a template the model imitates in
+            its next tool call — observed live on 2026-08-03, with the markers
+            reaching /bin/bash as literal input and corrupting the task. Setting
+            this True re-enables the (correct, tested) machinery below; do not,
+            until that imitation problem has an answer.
+        toolcall_threshold_ratio: the same anchoring for tool_call ARGUMENT
+            values (default 0.004), which need their own, much lower setpoint.
+            The message threshold reaches almost none of that mass: measured
+            2026-08-03, argument sizes are mid-tail (p50 94 chars, p90 1,630),
+            so 2% of n_ctx fires on 0 of 333 verbatim values while the mass
+            itself is 43% of the peak prompt and UNSHEDDABLE by Pass 3.
+        toolcall_min_shrink_ratio: hard floor under that ratio (default 2.0),
+            as a multiple of the stub's own rendered size. A value smaller than
+            the stub that replaces it makes the wire BIGGER, so this bound is
+            physical and holds at every context size — the same reasoning as
+            window_min_shrink_ratio, which exists because break-even was the
+            wrong bar for an operation with unpriced costs. 0 = no floor.
         context_budget_ratio: when > 0 (default 0.50) AND n_ctx is known, bound the
             TOTAL wire to this fraction of the real window by paging out the oldest
             non-pinned middle messages (lossless — they become retrievable stubs).
@@ -97,6 +117,16 @@ class ProxyConfig:
             the next one, so upstream prefix caches (KV or hybrid-SSM state)
             can extend instead of re-prefilling. 0 = legacy behavior: recompute
             and move the block every turn (a guaranteed per-turn prefix break).
+        recall_max_stale_ratio: anchors that bound to the real window (default
+            0.25) instead of holding it fixed. A constant 4000 tokens is three
+            different policies on three servers — 2% of a 200K window, 6% of
+            65K, 50% of 8K — and only the middle one was ever measured. Above
+            the windowing band (budget - target = 0.15), so the block refreshes
+            at most once per windowing cycle and tends to land on a flush epoch
+            where the break is already paid for. 0 = use the fixed token value.
+            Ignored when recall_max_stale_tokens is 0, since that explicitly
+            selects legacy per-turn recompute and a ratio must not re-enable
+            stickiness the operator turned off.
         hotness_half_life_seconds: exponential-decay half-life of the store's
             access scores (default 86400 = 24h). Shorter = memory "cools" faster,
             so recall ranking and (when run) eviction favor the recent working
@@ -174,15 +204,85 @@ class ProxyConfig:
     # definitely bulky AND too big to POST to llama-server /tokenize (slow + a DoS risk),
     # so it is handle-ized using a cheap char-based token ESTIMATE instead. 0 = no cap.
     tokenize_max_chars: int = 100000
+    # Explicit context window, when the upstream advertises none (Tier 3 of the
+    # window resolver). The OpenAI standard carries no context size anywhere, so
+    # a server that exposes no vendor extension leaves the governor with only
+    # observed evidence to work from; this is the operator saying what they know.
+    upstream_n_ctx: Optional[int] = None
     handle_threshold_ratio: float = 0.02
+    # tool_call ARGUMENT threshold, anchored to the real window like every other
+    # setpoint. Measured 2026-08-03 across three harnesses: argument mass is
+    # mid-tail, not a few giants, so the message threshold (2% of n_ctx) reaches
+    # almost none of it -- 0 of 333 verbatim values on the opencode capture.
+    # 0.004 comes from the sweep's optimum (256 tok at n_ctx 65536); the net
+    # saving curve peaks around there and TURNS OVER below it, because each stub
+    # costs ~137 tokens of its own.
+    # OFF by default since 2026-08-03. Stubbing a tool_call argument is not the
+    # same operation as stubbing message content, and the difference is not a
+    # matter of degree: `content` is context the model READS, while
+    # `tool_calls[].function.arguments` is the model's OWN PRIOR OUTPUT. Editing
+    # it puts text in the exact slot an autoregressive model imitates when it
+    # produces the next tool call — and it does. Measured on a live opencode run
+    # (aborted, `_runs/wire-ABORTED-toolcall-imitation-111732`): the model copied
+    # the stub markers verbatim, CM's real handles included, into new `bash`
+    # commands, which the shell then received as literal input:
+    #     /bin/bash: line 1: [[cm:stored: command not found
+    # The task produced wrong output, not just slow output. The threshold below
+    # is correct and tested; the OPERATION is what is unsafe, so the machinery
+    # stays behind this flag rather than being deleted.
+    handleize_toolcall_args: bool = False
+    toolcall_threshold_ratio: float = 0.004
+    # Hard floor under that ratio, as a multiple of the stub's own rendered size.
+    # This is physics, not preference: a value smaller than the stub replacing it
+    # BLOATS the wire, so the floor must hold at every context size (0.004 * 8192
+    # would be 33 tokens against a ~137-token stub -- a net loss on every fire).
+    # Expressed as a ratio so it tracks stub_preview_chars instead of drifting
+    # from it, exactly like window_min_shrink_ratio.
+    toolcall_min_shrink_ratio: float = 2.0
+    # Handle-ize oversized TEXT parts inside content-parts lists (2026-08-02).
+    # Pass 1 and Pass 3 both bail on `not isinstance(content, str)`, so a harness
+    # that sends tool results as content-parts is INVISIBLE to the governor: an
+    # opencode run measured structured_content at 66.3% of the wire against
+    # 12.9% string_content, i.e. two thirds of the payload had no code path.
+    # OFF by default: it changes the bytes of a message shape the rewriter has
+    # never touched before, so it is opt-in until proven on a live harness.
+    handleize_content_parts: bool = False
     context_budget_ratio: float = 0.50
     context_target_ratio: float = 0.35
     context_emergency_ratio: float = 0.0
+    # Minimum SHRINK a windowing page-out must achieve, as a multiple of the
+    # stub's own size: page only if orig_tokens >= ratio * stub_tokens (4.0 =
+    # the message must shrink to <=25% of itself). 0 = legacy break-even.
+    #
+    # WHY (measured 2026-08-02). _window_out's only guard was
+    # `if stub_tokens >= orig_tokens: return 0` — a BREAK-EVEN test. Break-even
+    # is the wrong threshold for an operation with costs the test does not
+    # model: paging a message that was already sent verbatim breaks the upstream
+    # prefix (a full re-prefill) and hides the content from the model. At
+    # break-even those costs are pure loss. A live hermes run paged 27 messages
+    # under 100 tokens, netting 39 tokens each after the ~25-token stub — and
+    # 5 of them were assistant turns, i.e. the model's own prior reasoning.
+    #
+    # Expressed as a RATIO, not an absolute floor, so it tracks the stub format
+    # instead of drifting when that format changes — same reasoning as
+    # stub_tokens_estimate, which renders a sample rather than hardcoding a size.
+    window_min_shrink_ratio: float = 4.0
     protect_first_n: int = 2
     protect_last_n: int = 6
     auto_recall_k: int = 3
     recall_budget_tokens: int = 1500
     recall_max_stale_tokens: int = 4000
+    # Anchor the staleness bound to the real window. A fixed 4000 tokens means
+    # three different policies on three servers -- 2% of a 200K window (rebuild
+    # constantly), 6% of 65K (the ~12 forced rebuilds measured on the opencode
+    # run, 6 of which cost a prefix break), 50% of 8K (never rebuild). Every
+    # other setpoint here is a fraction of n_ctx; this one was not.
+    # 0.25 sits above the windowing band (context_budget_ratio -
+    # context_target_ratio = 0.15), so the block refreshes at most once per
+    # windowing cycle and tends to land ON a flush epoch, where the prefix is
+    # already broken and the refresh rides for free.
+    # 0 = use the fixed recall_max_stale_tokens (the pre-2026-08-03 behaviour).
+    recall_max_stale_ratio: float = 0.25
     hotness_half_life_seconds: float = 86400.0
     ceiling_safety: float = 0.8
     max_conversations: int = 32
@@ -237,6 +337,22 @@ class ProxyConfig:
                 f"handle_threshold_ratio must be in 0.0..1.0 (0 = use fixed "
                 f"handle_threshold_tokens), got {self.handle_threshold_ratio}"
             )
+        if not (0.0 <= self.toolcall_threshold_ratio <= 1.0):
+            raise ValueError(
+                f"toolcall_threshold_ratio must be in 0.0..1.0 (0 = floor only), "
+                f"got {self.toolcall_threshold_ratio}"
+            )
+        if self.toolcall_min_shrink_ratio < 0:
+            raise ValueError(
+                "toolcall_min_shrink_ratio must be >= 0 (0 = no floor; a value "
+                "smaller than its own stub then bloats the wire), got "
+                f"{self.toolcall_min_shrink_ratio}"
+            )
+        if not (0.0 <= self.recall_max_stale_ratio <= 1.0):
+            raise ValueError(
+                f"recall_max_stale_ratio must be in 0.0..1.0 (0 = use fixed "
+                f"recall_max_stale_tokens), got {self.recall_max_stale_ratio}"
+            )
         if not (0.0 <= self.context_budget_ratio <= 1.0):
             raise ValueError(
                 f"context_budget_ratio must be in 0.0..1.0 (0 disables windowing), "
@@ -265,6 +381,11 @@ class ProxyConfig:
                 f"context_emergency_ratio ({self.context_emergency_ratio}) must be > "
                 f"context_budget_ratio ({self.context_budget_ratio}) — it is the HIGH "
                 f"water, above the existing MID-water trigger"
+            )
+        if self.window_min_shrink_ratio < 0:
+            raise ValueError(
+                "window_min_shrink_ratio must be >= 0 (0 = legacy break-even), "
+                f"got {self.window_min_shrink_ratio}"
             )
         if self.protect_first_n < 0:
             raise ValueError(f"protect_first_n must be >= 0, got {self.protect_first_n}")

@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -18,8 +19,10 @@ from .config import ProxyConfig
 from .diagnostics import WireCapture, WireDiagnostics
 from .metrics import StatsCollector
 from .rewriter import PromptRewriter, RewriteResult, normalize_volatile_stamps
-from .sensing import GovernorController, StreamTee, extract_usage_timings
+from .sensing import (GovernorController, StreamTee, canonical_content,
+                      extract_usage_timings)
 from .upstream import UpstreamClient, UpstreamError
+from .window import ContextWindowResolver, scan_for_window
 
 
 # Floor for the n_ctx-anchored handle-ization threshold (don't stub trivially small msgs).
@@ -36,6 +39,38 @@ def resolve_handle_threshold(config: ProxyConfig, n_ctx: Optional[int]) -> int:
     return config.handle_threshold_tokens
 
 
+def _extract_n_ctx(data) -> Optional[int]:
+    """Pull the true context size out of a parsed /props body. None on any
+    unexpected shape. Split out of ``_probe_n_ctx`` so the SAME parse can be
+    reused on a /props response we already fetched for a client — that is a free
+    re-probe, and n_ctx being a startup-only snapshot was its own failure mode."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        # default_generation_settings is a PER-SLOT blob, so its n_ctx is the
+        # per-request window -- the number every threshold must scale from.
+        return int(data["default_generation_settings"]["n_ctx"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        top = int(data["n_ctx"])  # some builds expose it at the top level
+    except (KeyError, TypeError, ValueError):
+        return None
+    # GUARD (2026-08-02): llama-server splits -c across slots under --parallel N,
+    # so a TOP-LEVEL n_ctx may be the total rather than the per-request window.
+    # Adopting it under --parallel 4 would size every threshold fourfold. We
+    # cannot tell the two apart on a 1-slot box, so divide when there is more
+    # than one slot -- wrong-small over-compresses, wrong-large lets the wire
+    # exceed the real window.
+    try:
+        slots = int(data.get("total_slots") or 1)
+    except (TypeError, ValueError):
+        slots = 1
+    if slots > 1:
+        top = top // slots
+    return top if top > 0 else None
+
+
 async def _probe_n_ctx(upstream: UpstreamClient) -> Optional[int]:
     """Best-effort read of llama-server's true context size from /props. None on any
     failure (server down at startup, unexpected shape) -> caller falls back."""
@@ -43,15 +78,122 @@ async def _probe_n_ctx(upstream: UpstreamClient) -> Optional[int]:
         data = await upstream.passthrough_get("/props")
     except Exception:
         return None
-    if not isinstance(data, dict):
-        return None
+    return _extract_n_ctx(data)
+
+
+def _adopt_n_ctx(app, n_ctx: Optional[int], source: str) -> bool:
+    """Adopt an upstream context size discovered AFTER startup.
+
+    n_ctx used to be probed once, in the lifespan, with a 5 s timeout. Two silent
+    failure modes followed: llama-server not up yet at proxy start left n_ctx
+    None for the process's whole life — which does not merely fall back to the
+    static threshold, it disables windowing entirely (`high_water` is None) —
+    and a llama-server restarted with a different `-c` left the proxy sizing
+    itself to a window that no longer existed.
+
+    The rewriter is updated IN PLACE (`update_context_size`) rather than rebuilt:
+    a rebuild would drop every windowing frontier and frozen recall block, i.e.
+    break the prefix of every live conversation to fix a setpoint. Per
+    conversation the handle threshold stays pinned to whatever it was first seen
+    with (`_pinned_threshold`), so an adopted change reaches new conversations
+    without re-cutting the stub decisions of conversations already in flight.
+
+    Best-effort and never raises: a sizing refresh must not be able to fail a
+    request. Returns True iff something changed.
+    """
+    if not n_ctx:
+        return False
     try:
-        return int(data["default_generation_settings"]["n_ctx"])
-    except (KeyError, TypeError, ValueError):
-        try:
-            return int(data["n_ctx"])  # some builds expose it at the top level
-        except (KeyError, TypeError, ValueError):
-            return None
+        n_ctx = int(n_ctx)
+    except (TypeError, ValueError):
+        return False
+    if n_ctx <= 0:
+        return False
+    try:
+        resolver = getattr(app.state, "window", None)
+        if resolver is not None:
+            resolver.offer(n_ctx, source)
+            # Read back the CLAMPED belief, not the raw offer: the resolver may
+            # raise it to a floor we have proof of, or lower it to a ceiling the
+            # upstream has rejected.
+            n_ctx = resolver.window or n_ctx
+    except Exception:
+        pass
+    if n_ctx == getattr(app.state, "n_ctx", None):
+        return False
+    try:
+        cfg = getattr(app.state, "config", None)
+        if cfg is None:
+            return False
+        threshold = resolve_handle_threshold(cfg, n_ctx)
+        rewriter = getattr(app.state, "rewriter", None)
+        if rewriter is not None:
+            rewriter.update_context_size(n_ctx, threshold)
+            app.state.config = rewriter.config
+        previous = getattr(app.state, "n_ctx", None)
+        app.state.n_ctx = n_ctx
+        app.state.n_ctx_source = source
+        app.state.n_ctx_adoptions = getattr(app.state, "n_ctx_adoptions", 0) + 1
+        app.state.n_ctx_previous = previous
+    except Exception:
+        return False
+    return True
+
+
+async def _ensure_n_ctx(app, min_interval: float = 30.0) -> None:
+    """If n_ctx is still unknown, try to learn it — rate-limited.
+
+    Losing the 5 s startup race against llama-server used to be permanent: no
+    n_ctx means no windowing at all for the life of the process. This makes that
+    recoverable without turning every request into a /props round-trip when the
+    upstream is genuinely down. Never raises."""
+    if getattr(app.state, "n_ctx", None):
+        return
+    now = time.monotonic()
+    if now < getattr(app.state, "n_ctx_next_probe", 0.0):
+        return
+    app.state.n_ctx_next_probe = now + min_interval
+    try:
+        found = await asyncio.wait_for(_probe_n_ctx(app.state.upstream), timeout=5.0)
+    except Exception:
+        return
+    _adopt_n_ctx(app, found, "lazy-reprobe")
+
+
+def _observe_window_success(app, observed: Optional[dict]) -> None:
+    """Tier 0. A prompt this large was ACCEPTED, so the usable window is at
+    least that big -- an observation, not a claim, and available on every
+    OpenAI-compatible provider. Raises the resolver's floor and, if the current
+    belief was smaller, records the contradiction. Never raises."""
+    try:
+        resolver = getattr(app.state, "window", None)
+        if resolver is None:
+            return
+        tokens = _prompt_tokens_of(observed)
+        if not tokens:
+            return
+        if resolver.observe_success(tokens):
+            # The declared window was BELOW something that demonstrably fit.
+            # Adopt the corrected belief rather than keep sizing to a claim
+            # reality has just falsified.
+            _adopt_n_ctx(app, resolver.window, "observed-floor")
+    except Exception:
+        pass
+
+
+def _observe_window_overflow(app, err: Any) -> None:
+    """Tier 0 upper bound. A context-length rejection proves the window is
+    smaller than what we sent. Deliberately narrow: an unclassifiable failure
+    must NOT move the belief, or a network blip shrinks every threshold."""
+    try:
+        resolver = getattr(app.state, "window", None)
+        if resolver is None:
+            return
+        body = getattr(err, "body", None) or getattr(err, "detail", None) or str(err)
+        if resolver.observe_overflow(str(body)):
+            _adopt_n_ctx(app, resolver.window, "observed-ceiling")
+    except Exception:
+        pass
 
 
 def _inject_context_length(data: dict, n_ctx: Optional[int]) -> dict:
@@ -87,13 +229,21 @@ def _apply_model_alias(data: dict, alias: Optional[str]) -> dict:
 
 
 def _sum_content_chars(messages: list) -> int:
-    """Total chars of string-valued message contents (free; no tokenization)."""
+    """Total chars of message content, str OR content-parts (free; no tokenization).
+
+    Used ONLY for the /metrics chars_in/chars_out counters — no decision reads it.
+
+    It used to count ``isinstance(c, str)`` only, which is the same blind spot
+    that made the governor invisible to content-parts harnesses: on an opencode
+    wire the bulk of the payload scored ZERO going in, while the string-shaped
+    recall block scored on the way out, so a request that genuinely shrank
+    34 KB -> 1.8 K tokens reported ``pct_saved: -11975%``. Counting through
+    ``canonical_content`` (the same serialization identity and growth estimates
+    already use) makes the ratio mean something on both wire shapes."""
     total = 0
     for m in messages:
         if isinstance(m, dict):
-            c = m.get("content")
-            if isinstance(c, str):
-                total += len(c)
+            total += len(canonical_content(m.get("content")))
     return total
 
 
@@ -291,6 +441,22 @@ def create_app(
         except Exception:
             app.state.n_ctx = None
 
+        # Tell the resolver what the startup probe found, and take the value
+        # back from IT. The lifespan used to set app.state.n_ctx directly and
+        # bypass the resolver entirely, so /metrics reported n_ctx 65536 beside
+        # a bracket reading "unresolved" -- the belief and the evidence behind
+        # it disagreed from the first request, on the surface that is supposed
+        # to make the belief auditable.
+        try:
+            resolver0 = getattr(app.state, "window", None)
+            if resolver0 is not None:
+                if app.state.n_ctx:
+                    resolver0.offer(app.state.n_ctx, "startup-probe")
+                app.state.n_ctx = resolver0.window or app.state.n_ctx
+                app.state.n_ctx_source = resolver0.source
+        except Exception:
+            pass
+
         resolved = config
         effective_threshold = resolve_handle_threshold(config, app.state.n_ctx)
         if effective_threshold != config.handle_threshold_tokens:
@@ -343,6 +509,8 @@ def create_app(
     # In-memory observability (Phase 5 §3). Set here (not only in the lifespan)
     # so it exists in injected-test mode too, where ASGITransport skips lifespan.
     app.state.stats = StatsCollector()
+    app.state.window = ContextWindowResolver(
+        configured=getattr(config, "upstream_n_ctx", None))
     # Wire-composition tee: per-component sizes of the FORWARDED payload paired
     # with the real usage.prompt_tokens of that same request. /metrics reports
     # peak_chars_out and real_prompt_tokens.peak as independent maxima over
@@ -431,6 +599,10 @@ def create_app(
         obs = None
         pressure: Optional[int] = None
         high_water: Optional[int] = None
+        # If the startup probe lost its race with llama-server, n_ctx is None and
+        # windowing is silently OFF for the life of the process. Rate-limited
+        # retry so that is recoverable; a no-op once n_ctx is known.
+        await _ensure_n_ctx(app)
         if controller is not None:
             try:
                 # Hand sensing the rewriter's settings so the pressure estimate
@@ -595,6 +767,7 @@ def create_app(
                         diag.attach_usage(diag_seq, _prompt_tokens_of(observed))
                     except Exception:
                         pass
+                _observe_window_success(app, observed)
                 if controller is not None and obs is not None:
                     try:
                         controller.observe_response(obs.key, observed,
@@ -609,6 +782,7 @@ def create_app(
         try:
             data = await upstream_client.chat_completion(payload)
         except UpstreamError as e:
+            _observe_window_overflow(app, e)
             return _upstream_error_response(e)
         if guard is not None:
             guard.observe_response(data)
@@ -621,6 +795,7 @@ def create_app(
                 diag.attach_usage(diag_seq, _prompt_tokens_of(observed))
             except Exception:
                 pass
+        _observe_window_success(app, observed)
         if controller is not None and obs is not None:
             try:
                 controller.observe_response(obs.key, observed)
@@ -640,6 +815,10 @@ def create_app(
         except UpstreamError as e:
             return _upstream_error_response(e)
         data = _apply_model_alias(data, app.state.config.model_alias)
+        # Tier 1: the standard endpoint. llama.cpp puts the window at
+        # data[].meta.n_ctx, vLLM at max_model_len -- vendor extensions on an
+        # OpenAI-shaped body, which is as close to universal as this gets.
+        _adopt_n_ctx(app, scan_for_window(data), "v1/models")
         data = _inject_context_length(data, app.state.n_ctx)
         return JSONResponse(data, media_type="application/json")
 
@@ -686,6 +865,10 @@ def create_app(
             data = await upstream_client.passthrough_get("/props")
         except UpstreamError as e:
             return _upstream_error_response(e)
+        # Free re-probe: this IS /props, freshly fetched. Harnesses call it on
+        # connect, so a llama-server restarted with a different -c is picked up
+        # the next time any client reconnects — no polling, no timers.
+        _adopt_n_ctx(app, _extract_n_ctx(data), "props-passthrough")
         return JSONResponse(data, media_type="application/json")
 
     # ------------------------------------------------- Ollama-style model discovery
@@ -740,7 +923,17 @@ def create_app(
     async def metrics():
         # Cumulative prompt-transform stats (Phase 5 §3) + retrieval-path counters
         # from the shared store (Phase 7 Stage 1). Does NOT touch upstream.
-        snap = app.state.stats.snapshot()
+        # Hand the collector sensing's OBSERVED peak so the summary reports a
+        # measured prompt size instead of an estimate over message content,
+        # which under-reported 9,558 against a real 37,864.
+        real_peak = None
+        try:
+            ctrl0 = app.state.controller
+            if ctrl0 is not None:
+                real_peak = (ctrl0.snapshot().get("real_prompt_tokens") or {}).get("peak")
+        except Exception:
+            real_peak = None
+        snap = app.state.stats.snapshot(real_peak_prompt_tokens=real_peak)
         store = app.state.store
         if store is not None:
             stats_fn = getattr(store, "stats", None)
@@ -749,10 +942,43 @@ def create_app(
                     snap["retrieval"] = stats_fn()
                 except Exception:
                     pass
+        # Name the store ABSOLUTELY, for the same reason n_ctx resolution is made
+        # visible below: one config file addressed two different directories for
+        # two days (2026-08-03), because a relative store_root was resolved against
+        # the launcher's CWD. A reset the governor never saw is indistinguishable
+        # from a reset that worked unless this line exists — and `corpus_size`
+        # above is read off whichever store happens to be live.
+        snap["store_root"] = os.path.abspath(config.store_root)
         # Phase 14a: the closed-loop view — real prompt sizes, reuse ratios,
         # break attribution, learned ceilings, per-conversation ledger. The
         # goal: a session like the 2026-07-19 shakedown needs ZERO server-log
         # forensics.
+        # Upstream sizing, made VISIBLE. "windowing is silently off because the
+        # startup probe lost its race with llama-server" was previously only
+        # discoverable by reading code; resolved=false says it outright.
+        cfg_now = getattr(app.state, "config", None)
+        n_ctx_now = getattr(app.state, "n_ctx", None)
+        upstream_context = {
+            "n_ctx": n_ctx_now,
+            "resolved": bool(n_ctx_now),
+            "source": getattr(app.state, "n_ctx_source", "startup-probe"),
+            "adoptions": getattr(app.state, "n_ctx_adoptions", 0),
+            "previous_n_ctx": getattr(app.state, "n_ctx_previous", None),
+            "handle_threshold_tokens": (
+                cfg_now.handle_threshold_tokens if cfg_now is not None else None),
+            "windowing_enabled": bool(
+                n_ctx_now and cfg_now is not None and cfg_now.context_budget_ratio > 0.0),
+        }
+        # The evidence BEHIND the belief: what was declared, what has been proven
+        # to fit, what has been proven too long. A window figure with no bracket
+        # is a claim; with one it is auditable.
+        resolver = getattr(app.state, "window", None)
+        if resolver is not None:
+            try:
+                upstream_context["bracket"] = resolver.snapshot()
+            except Exception:
+                pass
+        snap["upstream_context"] = upstream_context
         ctrl = app.state.controller
         if ctrl is not None:
             try:
